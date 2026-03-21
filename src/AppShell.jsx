@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { onUser, signInGoogle, signOutUser, fsLoadAll, fsSave } from "./firebase.js";
 
 // ============================================================================
-// Storage
+// Storage -- localStorage primary, Firestore sync when signed in
 // ============================================================================
 const KEYS = {
   trials: "yks_trials",
@@ -15,12 +16,18 @@ const KEYS = {
   challenge: "yks_challenge",
 };
 
+// Current signed-in uid -- set by App() once auth resolves
+let _syncUid = null;
+
 const store = {
   load: (k, fb) => {
     try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : fb; } catch { return fb; }
   },
   save: (k, v) => {
+    // 1. Always write localStorage first (instant, offline-safe)
     try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* ignore */ }
+    // 2. If signed in, also sync to Firestore (fire-and-forget)
+    if (_syncUid) fsSave(_syncUid, k, v);
   },
 };
 
@@ -2119,6 +2126,34 @@ function DisciplineTab({ trials, todos }) {
 // ============================================================================
 // APP
 // ============================================================================
+
+// Small auth banner shown inside the existing header area
+function AuthBanner({ user, onSignIn, onSignOut, syncing }) {
+  if (user) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: "8px", padding: "6px 10px", background: "var(--s2)", borderRadius: "8px", border: "1px solid var(--b1)", marginBottom: "12px" }}>
+        {user.photoURL && <img src={user.photoURL} alt="" style={{ width: "20px", height: "20px", borderRadius: "50%", flexShrink: 0 }} />}
+        <span style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--grn)", flex: 1 }}>
+          {syncing ? "syncing..." : user.displayName || user.email}
+        </span>
+        <button onClick={onSignOut} style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)", background: "none", border: "1px solid var(--b2)", borderRadius: "4px", padding: "3px 8px", cursor: "pointer" }}>
+          Cikis
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: "8px", padding: "6px 10px", background: "var(--s2)", borderRadius: "8px", border: "1px solid var(--b1)", marginBottom: "12px" }}>
+      <span style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--muted)", flex: 1 }}>
+        Yerel mod -- giris yap ve verileri buluta kaydet
+      </span>
+      <button onClick={onSignIn} style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--acc)", background: "var(--acc)15", border: "1px solid var(--acc)44", borderRadius: "4px", padding: "3px 10px", cursor: "pointer", fontWeight: "600" }}>
+        Google ile Giris
+      </button>
+    </div>
+  );
+}
+
 export default function App() {
   const [tab, setTab]       = useState("plan");
   const [trials, setTrials] = useState(() => store.load(KEYS.trials, []));
@@ -2127,6 +2162,50 @@ export default function App() {
   const [xp, setXp]         = useState(loadXP);
   const toasts              = useToastSystem();
 
+  // Auth state: undefined=loading, null=signed-out, object=signed-in
+  const [user, setUser]     = useState(undefined);
+  const [syncing, setSyncing] = useState(false);
+
+  // Listen to Firebase auth state
+  useEffect(() => {
+    const unsub = onUser(async (fbUser) => {
+      setUser(fbUser);
+
+      if (fbUser) {
+        // Set uid so store.save() starts syncing
+        _syncUid = fbUser.uid;
+
+        // Pull cloud data and merge into localStorage (cloud wins on conflict)
+        setSyncing(true);
+        try {
+          const cloud = await fsLoadAll(fbUser.uid);
+          let needsRefresh = false;
+          Object.entries(cloud).forEach(([k, v]) => {
+            // Only overwrite if cloud version is newer/different
+            const local = store.load(k, null);
+            const localStr = JSON.stringify(local);
+            const cloudStr = JSON.stringify(v);
+            if (cloudStr !== localStr) {
+              try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* ignore */ }
+              needsRefresh = true;
+            }
+          });
+          // Refresh React state if cloud had newer data
+          if (needsRefresh) {
+            setTrials(store.load(KEYS.trials, []));
+            setTodos(store.load(KEYS.todos, []));
+            setXp(loadXP());
+          }
+        } catch { /* offline or Firestore error -- keep localStorage */ }
+        setSyncing(false);
+      } else {
+        _syncUid = null;
+      }
+    });
+    return unsub;
+  }, []);
+
+  // XP polling
   useEffect(() => {
     const id = setInterval(() => setXp(loadXP()), 4000);
     return () => clearInterval(id);
@@ -2158,11 +2237,27 @@ export default function App() {
     return { plan: planLate, brain: 0, trials: 0, todos: todoOverdue, discipline: missingCheckin };
   }, [todos, checkins, plans, tab]);
 
+  // While auth state is resolving, show nothing (avoids flash)
+  if (user === undefined) {
+    return (
+      <div style={{ minHeight: "100vh", background: "var(--bg)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <style>{CSS}</style>
+        <span style={{ fontFamily: "var(--mono)", fontSize: "11px", color: "var(--muted)", animation: "blink 1.5s ease infinite" }}>...</span>
+      </div>
+    );
+  }
+
   return (
     <div style={{ minHeight: "100vh", background: "var(--bg)", fontFamily: "var(--sans)", display: "flex", justifyContent: "center", padding: "24px 12px 80px" }}>
       <style>{CSS}</style>
       <div style={{ width: "100%", maxWidth: "540px" }}>
         <Header onToggleHeat={() => setHeat((p) => !p)} heatOpen={heatOpen} alerts={alerts} xp={xp} />
+        <AuthBanner
+          user={user}
+          syncing={syncing}
+          onSignIn={() => signInGoogle().catch(() => {})}
+          onSignOut={() => { signOutUser(); _syncUid = null; }}
+        />
         {heatOpen && (
           <div className="fi" style={{ marginBottom: "14px" }}>
             <Card style={{ padding: "13px 14px" }}>
@@ -2183,4 +2278,3 @@ export default function App() {
     </div>
   );
 }
-{/* redeploy trigger */}
