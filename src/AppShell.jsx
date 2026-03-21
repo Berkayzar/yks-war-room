@@ -2161,6 +2161,22 @@ function DisciplineTab({ trials, todos }) {
 // ============================================================================
 
 function AuthBanner({ user, onSignIn, onSignOut, syncing, isAdmin }) {
+  const [signingIn, setSigningIn] = useState(false);
+  const [err, setErr] = useState("");
+
+  const handleSignIn = async () => {
+    setErr("");
+    setSigningIn(true);
+    try {
+      await onSignIn();
+    } catch (e) {
+      console.error("Sign in error:", e);
+      setErr(e?.code || e?.message || "Giris hatasi");
+    } finally {
+      setSigningIn(false);
+    }
+  };
+
   if (user) {
     return (
       <div style={{ display: "flex", alignItems: "center", gap: "8px", padding: "6px 10px", background: "var(--s2)", borderRadius: "8px", border: "1px solid var(--b1)", marginBottom: "12px" }}>
@@ -2176,13 +2192,23 @@ function AuthBanner({ user, onSignIn, onSignOut, syncing, isAdmin }) {
     );
   }
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: "8px", padding: "6px 10px", background: "var(--s2)", borderRadius: "8px", border: "1px solid var(--b1)", marginBottom: "12px" }}>
-      <span style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--muted)", flex: 1 }}>
-        Yerel mod -- giris yap ve verileri buluta kaydet
-      </span>
-      <button onClick={onSignIn} style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--acc)", background: "var(--acc)15", border: "1px solid var(--acc)44", borderRadius: "4px", padding: "3px 10px", cursor: "pointer", fontWeight: "600" }}>
-        Google ile Giris
-      </button>
+    <div style={{ display: "flex", flexDirection: "column", gap: "6px", marginBottom: "12px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "8px", padding: "6px 10px", background: "var(--s2)", borderRadius: "8px", border: "1px solid var(--b1)" }}>
+        <span style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--muted)", flex: 1 }}>
+          Yerel mod -- giris yap ve verileri buluta kaydet
+        </span>
+        <button
+          onClick={handleSignIn}
+          disabled={signingIn}
+          style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--acc)", background: "var(--acc)15", border: "1px solid var(--acc)44", borderRadius: "4px", padding: "3px 10px", cursor: signingIn ? "wait" : "pointer", fontWeight: "600", opacity: signingIn ? 0.6 : 1 }}>
+          {signingIn ? "Bekleniyor..." : "Google ile Giris"}
+        </button>
+      </div>
+      {err && (
+        <p style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--red)", padding: "4px 10px" }}>
+          Hata: {err}
+        </p>
+      )}
     </div>
   );
 }
@@ -2200,7 +2226,7 @@ export default function App() {
   const [isAdmin, setIsAdmin] = useState(false);
   const [showAdmin, setShowAdmin] = useState(false);
 
-useEffect(() => {
+  useEffect(() => {
     checkRedirect().catch(() => {});
 
     const unsub = onUser(async (fbUser) => {
@@ -2223,12 +2249,12 @@ useEffect(() => {
           const cloud = await fsLoadAll(fbUser.uid);
           let needsRefresh = false;
           Object.entries(cloud).forEach(([k, v]) => {
-            const local = store.load(k, null)
+            const local = store.load(k, null);
             if (JSON.stringify(v) !== JSON.stringify(local)) {
               try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* ignore */ }
               needsRefresh = true;
             }
-          })
+          });
           if (needsRefresh) {
             setTrials(store.load(KEYS.trials, []));
             setTodos(store.load(KEYS.todos, []));
@@ -2246,7 +2272,8 @@ useEffect(() => {
       }
     });
     return unsub;
-  }, [])
+  }, []);
+
   useEffect(() => {
     const id = setInterval(() => setXp(loadXP()), 4000);
     return () => clearInterval(id);
@@ -2278,7 +2305,7 @@ useEffect(() => {
     return { plan: planLate, brain: 0, trials: 0, todos: todoOverdue, discipline: missingCheckin };
   }, [todos, checkins, plans, tab]);
 
-   if (user === undefined) {
+  if (user === undefined) {
     return (
       <div style={{ minHeight: "100vh", background: "var(--bg)", display: "flex", alignItems: "center", justifyContent: "center" }}>
         <style>{CSS}</style>
@@ -2315,7 +2342,7 @@ useEffect(() => {
           user={user}
           syncing={syncing}
           isAdmin={isAdmin}
-          onSignIn={() => signInGoogle().catch(() => {})}
+          onSignIn={() => signInGoogle()}
           onSignOut={() => { signOutUser(); _syncUid = null; _syncUser = null; }}
         />
         {isAdmin && (

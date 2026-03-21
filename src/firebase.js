@@ -1,4 +1,4 @@
-import { initializeApp } from "firebase/app"
+import { initializeApp } from "firebase/app";
 import {
   getAuth,
   GoogleAuthProvider,
@@ -109,7 +109,8 @@ export async function fsLoadAll(uid) {
   });
   return out;
 }
- export function fsSave(uid, key, value) {
+
+export function fsSave(uid, key, value) {
   if (!db || !uid) return;
   setDoc(doc(db, "users", uid, "data", key), { v: value }).catch(() => {});
 }
