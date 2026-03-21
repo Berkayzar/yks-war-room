@@ -2,8 +2,7 @@ import { initializeApp } from "firebase/app";
 import {
   getAuth,
   GoogleAuthProvider,
-  signInWithPopup,
-  signInWithRedirect,
+signInWithRedirect,
   getRedirectResult,
   signOut,
   onAuthStateChanged,
@@ -23,7 +22,7 @@ import {
 } from "firebase/firestore";
 
 const firebaseConfig = {
-  apiKey:            import.meta.env.VITE_FB_API_KEY,
+  apiKey:            import.meta.env.VITE_FB_API_KEY || "BURAYA_GERCEK_API_KEY_YAZ",
   authDomain:        "yks-savas-odasi.firebaseapp.com",
   projectId:         "yks-savas-odasi",
   storageBucket:     "yks-savas-odasi.firebasestorage.app",
@@ -48,15 +47,14 @@ export { app, auth, db };
 // ============================================================================
 // Auth
 // ============================================================================
-const provider = new GoogleAuthProvider();
-
-const isLocalhost = typeof window !== "undefined" &&
-  (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
-
+const provider = new GoogleAuthProvider()
 export const signInGoogle = () => {
-  if (!auth) return Promise.reject("auth not ready");
-  if (isLocalhost) return signInWithPopup(auth, provider);
-  return signInWithRedirect(auth, provider);
+  if (!auth) return Promise.reject(new Error("auth not ready"));
+  console.log("signInGoogle called, hostname:", window.location.hostname);
+  return signInWithRedirect(auth, provider).catch((e) => {
+    console.error("redirect error:", e.code, e.message);
+    throw e;
+  });
 };
 
 export const signOutUser = () => {

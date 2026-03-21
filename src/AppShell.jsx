@@ -2171,7 +2171,7 @@ function AuthBanner({ user, onSignIn, onSignOut, syncing, isAdmin }) {
       await onSignIn();
     } catch (e) {
       console.error("Sign in error:", e);
-      setErr(e?.code || e?.message || "Giris hatasi");
+      setErr(e?.code || e?.message || String(e));
     } finally {
       setSigningIn(false);
     }
@@ -2227,7 +2227,12 @@ export default function App() {
   const [showAdmin, setShowAdmin] = useState(false);
 
   useEffect(() => {
-    checkRedirect().catch(() => {});
+    // Handle Google redirect result on page load
+    checkRedirect().then((result) => {
+      if (result?.user) console.log("Redirect login success:", result.user.email);
+    }).catch((e) => {
+      console.error("checkRedirect error:", e?.code, e?.message);
+    });
 
     const unsub = onUser(async (fbUser) => {
       setUser(fbUser);
