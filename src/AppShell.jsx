@@ -2226,6 +2226,17 @@ export default function App() {
   const [isAdmin, setIsAdmin] = useState(false);
   const [showAdmin, setShowAdmin] = useState(false);
 
+  // Admin check -- uid degisince calis
+  useEffect(() => {
+    const uid = user?.uid;
+    if (!uid) { setIsAdmin(false); return; }
+    console.log("Running admin check for uid:", uid);
+    checkIsAdmin(uid).then((result) => {
+      console.log("Admin check FINAL result:", result);
+      setIsAdmin(result);
+    });
+  }, [user?.uid]);
+
   useEffect(() => {
     // Handle Google redirect result on page load
     checkRedirect().then((result) => {
@@ -2241,12 +2252,20 @@ export default function App() {
         _syncUid  = fbUser.uid;
         _syncUser = fbUser;
 
-        // Write profile on every login
         writeProfile(fbUser.uid, fbUser);
 
-        // Check admin role
-        const adminCheck = await checkIsAdmin(fbUser.uid);
-        setIsAdmin(adminCheck);
+        // Hemen summary yaz -- admin panelinde gorunsun
+        scheduleSummary(fbUser.uid, {
+          email:        fbUser.email || "",
+          displayName:  fbUser.displayName || "",
+          photoURL:     fbUser.photoURL || "",
+          xp:           0,
+          streak:       0,
+          todoCount:    0,
+          trialCount:   0,
+          checkinCount: 0,
+          planCount:    0,
+        });
 
         // Pull cloud data and merge into localStorage
         setSyncing(true);
