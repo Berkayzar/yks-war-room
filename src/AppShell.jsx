@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { onUser, signInGoogle, signOutUser, fsLoadAll, fsSave } from "./firebase.js";
+import {
+  onUser, signInGoogle, signOutUser, fsLoadAll, fsSave, checkRedirect,
+  checkIsAdmin, writeProfile, scheduleSummary, logActivity,
+  adminGetUsers, adminGetUserData,
+} from "./firebase.js";
 
 // ============================================================================
 // Storage -- localStorage primary, Firestore sync when signed in
@@ -18,6 +22,7 @@ const KEYS = {
 
 // Current signed-in uid -- set by App() once auth resolves
 let _syncUid = null;
+let _syncUser = null; // full user object for summary writes
 
 const store = {
   load: (k, fb) => {
@@ -26,10 +31,38 @@ const store = {
   save: (k, v) => {
     // 1. Always write localStorage first (instant, offline-safe)
     try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* ignore */ }
-    // 2. If signed in, also sync to Firestore (fire-and-forget)
-    if (_syncUid) fsSave(_syncUid, k, v);
+    // 2. If signed in, sync to Firestore
+    if (_syncUid) {
+      fsSave(_syncUid, k, v);
+      logActivity(_syncUid, k);
+      // Build summary from current localStorage state
+      _writeSummary(_syncUid, _syncUser);
+    }
   },
 };
+
+function _writeSummary(uid, user) {
+  if (!uid || !user) return;
+  try {
+    const xpData   = JSON.parse(localStorage.getItem("yks_xp")    || "{}");
+    const todos    = JSON.parse(localStorage.getItem("yks_todos")  || "[]");
+    const trials   = JSON.parse(localStorage.getItem("yks_trials") || "[]");
+    const checkins = JSON.parse(localStorage.getItem("yks_checkins") || "[]");
+    const plans    = JSON.parse(localStorage.getItem("yks_plan")   || "{}");
+    const planCount = Object.values(plans).flat().length;
+    scheduleSummary(uid, {
+      email:        user.email || "",
+      displayName:  user.displayName || "",
+      photoURL:     user.photoURL || "",
+      xp:           xpData.points  || 0,
+      streak:       xpData.streak  || 0,
+      todoCount:    todos.length,
+      trialCount:   trials.length,
+      checkinCount: checkins.length,
+      planCount,
+    });
+  } catch { /* ignore */ }
+}
 
 // ============================================================================
 // Utils
@@ -2127,8 +2160,7 @@ function DisciplineTab({ trials, todos }) {
 // APP
 // ============================================================================
 
-// Small auth banner shown inside the existing header area
-function AuthBanner({ user, onSignIn, onSignOut, syncing }) {
+function AuthBanner({ user, onSignIn, onSignOut, syncing, isAdmin }) {
   if (user) {
     return (
       <div style={{ display: "flex", alignItems: "center", gap: "8px", padding: "6px 10px", background: "var(--s2)", borderRadius: "8px", border: "1px solid var(--b1)", marginBottom: "12px" }}>
@@ -2136,6 +2168,7 @@ function AuthBanner({ user, onSignIn, onSignOut, syncing }) {
         <span style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--grn)", flex: 1 }}>
           {syncing ? "syncing..." : user.displayName || user.email}
         </span>
+        {isAdmin && <span style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--pur)", background: "var(--pur)18", border: "1px solid var(--pur)33", borderRadius: "4px", padding: "2px 7px" }}>ADMIN</span>}
         <button onClick={onSignOut} style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)", background: "none", border: "1px solid var(--b2)", borderRadius: "4px", padding: "3px 8px", cursor: "pointer" }}>
           Cikis
         </button>
@@ -2162,50 +2195,58 @@ export default function App() {
   const [xp, setXp]         = useState(loadXP);
   const toasts              = useToastSystem();
 
-  // Auth state: undefined=loading, null=signed-out, object=signed-in
-  const [user, setUser]     = useState(undefined);
+  const [user, setUser]       = useState(undefined);
   const [syncing, setSyncing] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [showAdmin, setShowAdmin] = useState(false);
 
-  // Listen to Firebase auth state
-  useEffect(() => {
+useEffect(() => {
+    checkRedirect().catch(() => {});
+
     const unsub = onUser(async (fbUser) => {
       setUser(fbUser);
 
       if (fbUser) {
-        // Set uid so store.save() starts syncing
-        _syncUid = fbUser.uid;
+        _syncUid  = fbUser.uid;
+        _syncUser = fbUser;
 
-        // Pull cloud data and merge into localStorage (cloud wins on conflict)
+        // Write profile on every login
+        writeProfile(fbUser.uid, fbUser);
+
+        // Check admin role
+        const adminCheck = await checkIsAdmin(fbUser.uid);
+        setIsAdmin(adminCheck);
+
+        // Pull cloud data and merge into localStorage
         setSyncing(true);
         try {
           const cloud = await fsLoadAll(fbUser.uid);
           let needsRefresh = false;
           Object.entries(cloud).forEach(([k, v]) => {
-            // Only overwrite if cloud version is newer/different
-            const local = store.load(k, null);
-            const localStr = JSON.stringify(local);
-            const cloudStr = JSON.stringify(v);
-            if (cloudStr !== localStr) {
+            const local = store.load(k, null)
+            if (JSON.stringify(v) !== JSON.stringify(local)) {
               try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* ignore */ }
               needsRefresh = true;
             }
-          });
-          // Refresh React state if cloud had newer data
+          })
           if (needsRefresh) {
             setTrials(store.load(KEYS.trials, []));
             setTodos(store.load(KEYS.todos, []));
             setXp(loadXP());
           }
-        } catch { /* offline or Firestore error -- keep localStorage */ }
+          // Write initial summary after sync
+          _writeSummary(fbUser.uid, fbUser);
+        } catch { /* offline -- keep localStorage */ }
         setSyncing(false);
       } else {
-        _syncUid = null;
+        _syncUid  = null;
+        _syncUser = null;
+        setIsAdmin(false);
+        setShowAdmin(false);
       }
     });
     return unsub;
-  }, []);
-
-  // XP polling
+  }, [])
   useEffect(() => {
     const id = setInterval(() => setXp(loadXP()), 4000);
     return () => clearInterval(id);
@@ -2229,20 +2270,38 @@ export default function App() {
   const plans    = useMemo(() => store.load(KEYS.plan, {}),    [tab]);
 
   const alerts = useMemo(() => {
-    const today      = todayStr();
-    const todayPlan  = plans[today] || [];
-    const planLate   = todayPlan.filter((p) => !p.done && p.startMin + p.durationMin < nowHHMM()).length;
+    const today       = todayStr();
+    const todayPlan   = plans[today] || [];
+    const planLate    = todayPlan.filter((p) => !p.done && p.startMin + p.durationMin < nowHHMM()).length;
     const todoOverdue = todos.filter((t) => !t.done && !t.reviewed && t.reviewAt && daysFrom(t.reviewAt) >= 0).length;
     const missingCheckin = checkins.find((c) => c.date === today) ? 0 : 1;
     return { plan: planLate, brain: 0, trials: 0, todos: todoOverdue, discipline: missingCheckin };
   }, [todos, checkins, plans, tab]);
 
-  // While auth state is resolving, show nothing (avoids flash)
-  if (user === undefined) {
+   if (user === undefined) {
     return (
       <div style={{ minHeight: "100vh", background: "var(--bg)", display: "flex", alignItems: "center", justifyContent: "center" }}>
         <style>{CSS}</style>
         <span style={{ fontFamily: "var(--mono)", fontSize: "11px", color: "var(--muted)", animation: "blink 1.5s ease infinite" }}>...</span>
+      </div>
+    );
+  }
+
+  // Admin panel view
+  if (isAdmin && showAdmin) {
+    return (
+      <div style={{ minHeight: "100vh", background: "var(--bg)", fontFamily: "var(--sans)", display: "flex", justifyContent: "center", padding: "24px 12px 80px" }}>
+        <style>{CSS}</style>
+        <div style={{ width: "100%", maxWidth: "700px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px" }}>
+            <h1 style={{ fontFamily: "var(--mono)", fontSize: "14px", fontWeight: "700", color: "var(--pur)" }}>ADMIN PANEL</h1>
+            <button onClick={() => setShowAdmin(false)} style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--muted)", background: "none", border: "1px solid var(--b2)", borderRadius: "6px", padding: "5px 12px", cursor: "pointer" }}>
+              Uygulamaya Don
+            </button>
+          </div>
+          <AdminPanel />
+        </div>
+        <ToastLayer toasts={toasts} />
       </div>
     );
   }
@@ -2255,9 +2314,17 @@ export default function App() {
         <AuthBanner
           user={user}
           syncing={syncing}
+          isAdmin={isAdmin}
           onSignIn={() => signInGoogle().catch(() => {})}
-          onSignOut={() => { signOutUser(); _syncUid = null; }}
+          onSignOut={() => { signOutUser(); _syncUid = null; _syncUser = null; }}
         />
+        {isAdmin && (
+          <button
+            onClick={() => setShowAdmin(true)}
+            style={{ width: "100%", marginBottom: "12px", padding: "8px", fontFamily: "var(--mono)", fontSize: "10px", color: "var(--pur)", background: "var(--pur)10", border: "1px solid var(--pur)33", borderRadius: "8px", cursor: "pointer" }}>
+            Admin Panelini Ac
+          </button>
+        )}
         {heatOpen && (
           <div className="fi" style={{ marginBottom: "14px" }}>
             <Card style={{ padding: "13px 14px" }}>
@@ -2275,6 +2342,211 @@ export default function App() {
         </div>
       </div>
       <ToastLayer toasts={toasts} />
+    </div>
+  );
+}
+
+// ============================================================================
+// ADMIN PANEL
+// ============================================================================
+function AdminPanel() {
+  const [users, setUsers]         = useState([]);
+  const [loading, setLoading]     = useState(true);
+  const [selected, setSelected]   = useState(null); // selected uid
+  const [detail, setDetail]       = useState(null);  // { data, profile, activity }
+  const [detailLoading, setDetailLoading] = useState(false);
+
+  useEffect(() => {
+    adminGetUsers().then((u) => {
+      // Sort by lastSeen desc
+      const sorted = u.sort((a, b) => {
+        const at = a.lastSeen?.seconds || 0;
+        const bt = b.lastSeen?.seconds || 0;
+        return bt - at;
+      });
+      setUsers(sorted);
+      setLoading(false);
+    });
+  }, []);
+
+  const selectUser = async (uid) => {
+    setSelected(uid);
+    setDetail(null);
+    setDetailLoading(true);
+    const d = await adminGetUserData(uid);
+    setDetail(d);
+    setDetailLoading(false);
+  };
+
+  const fmtTs = (ts) => {
+    if (!ts) return "--";
+    const d = ts.seconds ? new Date(ts.seconds * 1000) : new Date(ts);
+    return d.toLocaleString("tr-TR", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+  };
+
+  if (loading) {
+    return <p style={{ fontFamily: "var(--mono)", fontSize: "12px", color: "var(--muted)", textAlign: "center", padding: "40px" }}>Yukleniyor...</p>;
+  }
+
+  if (selected && detail) {
+    const u = users.find((x) => x.uid === selected) || {};
+    const xpData   = detail.data?.yks_xp     || {};
+    const todos    = detail.data?.yks_todos   || [];
+    const trials   = detail.data?.yks_trials  || [];
+    const checkins = detail.data?.yks_checkins || [];
+    const plans    = detail.data?.yks_plan    || {};
+    const planItems = Object.values(plans).flat();
+
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
+        <button onClick={() => { setSelected(null); setDetail(null); }}
+          style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--muted)", background: "none", border: "1px solid var(--b2)", borderRadius: "6px", padding: "5px 12px", cursor: "pointer", alignSelf: "flex-start" }}>
+          Listeye Don
+        </button>
+
+        {/* User header */}
+        <Card style={{ padding: "14px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+            {u.photoURL && <img src={u.photoURL} alt="" style={{ width: "36px", height: "36px", borderRadius: "50%" }} />}
+            <div style={{ flex: 1 }}>
+              <p style={{ fontWeight: "600", fontSize: "14px" }}>{u.displayName || "--"}</p>
+              <p style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--muted)" }}>{u.email}</p>
+              <p style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)", marginTop: "2px" }}>uid: {selected}</p>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <p style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--muted)" }}>Son giris</p>
+              <p style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--acc)" }}>{fmtTs(u.lastSeen)}</p>
+            </div>
+          </div>
+        </Card>
+
+        {/* Stats grid */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "8px" }}>
+          {[
+            { l: "XP",      v: xpData.points  || 0, c: "var(--pur)" },
+            { l: "Streak",  v: xpData.streak  || 0, c: "var(--acc)" },
+            { l: "Blok",    v: xpData.totalBlocks || 0, c: "var(--blu)" },
+            { l: "Plan",    v: planItems.length,    c: "var(--grn)" },
+            { l: "Gorev",   v: todos.length,        c: "var(--acc)" },
+            { l: "Deneme",  v: trials.length,       c: "var(--pur)" },
+            { l: "Checkin", v: checkins.length,     c: "var(--grn)" },
+            { l: "Plan Done", v: planItems.filter((x) => x.done).length, c: "var(--grn)" },
+            { l: "Todo Done", v: todos.filter((t) => t.done).length, c: "var(--grn)" },
+          ].map((x) => (
+            <div key={x.l} style={{ padding: "10px", background: "var(--s2)", borderRadius: "8px", textAlign: "center" }}>
+              <p style={{ fontFamily: "var(--mono)", fontSize: "18px", fontWeight: "700", color: x.c }}>{x.v}</p>
+              <p style={{ fontSize: "9px", color: "var(--muted)", marginTop: "2px" }}>{x.l}</p>
+            </div>
+          ))}
+        </div>
+
+        {/* Activity log */}
+        {detail.activity?.length > 0 && (
+          <Card style={{ padding: "14px" }}>
+            <Label style={{ marginBottom: "10px" }}>Son Aktivite (20)</Label>
+            <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+              {detail.activity.map((a) => (
+                <div key={a.id} style={{ display: "flex", justifyContent: "space-between", padding: "5px 8px", background: "var(--s2)", borderRadius: "5px" }}>
+                  <span style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--acc)" }}>
+                    {a.key?.replace("yks_", "") || "--"}
+                  </span>
+                  <span style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)" }}>
+                    {fmtTs(a.at)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </Card>
+        )}
+
+        {/* Recent trials */}
+        {trials.length > 0 && (
+          <Card style={{ padding: "14px" }}>
+            <Label style={{ marginBottom: "10px" }}>Denemeler ({trials.length})</Label>
+            <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
+              {trials.slice(0, 5).map((t, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "6px 9px", background: "var(--s2)", borderRadius: "6px" }}>
+                  <span style={{ fontSize: "12px" }}>{t.type} -- {t.date}</span>
+                  <span style={{ fontFamily: "var(--mono)", fontSize: "11px", color: "var(--acc)" }}>{t.totalNet} net</span>
+                </div>
+              ))}
+              {trials.length > 5 && <p style={{ fontSize: "10px", color: "var(--muted)", textAlign: "center" }}>+{trials.length - 5} daha</p>}
+            </div>
+          </Card>
+        )}
+
+        {/* Recent checkins */}
+        {checkins.length > 0 && (
+          <Card style={{ padding: "14px" }}>
+            <Label style={{ marginBottom: "10px" }}>Check-in ({checkins.length})</Label>
+            <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+              {checkins.slice(0, 7).map((c, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "5px 8px", background: "var(--s2)", borderRadius: "5px" }}>
+                  <span style={{ fontFamily: "var(--mono)", fontSize: "10px" }}>{c.date}</span>
+                  <span style={{ fontFamily: "var(--mono)", fontSize: "10px", color: c.score >= 3 ? "var(--grn)" : "var(--acc)" }}>{c.score}/4</span>
+                </div>
+              ))}
+            </div>
+          </Card>
+        )}
+      </div>
+    );
+  }
+
+  if (selected && detailLoading) {
+    return (
+      <div>
+        <button onClick={() => setSelected(null)} style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--muted)", background: "none", border: "1px solid var(--b2)", borderRadius: "6px", padding: "5px 12px", cursor: "pointer", marginBottom: "16px" }}>Listeye Don</button>
+        <p style={{ fontFamily: "var(--mono)", fontSize: "12px", color: "var(--muted)", textAlign: "center", padding: "40px" }}>Veri yukleniyor...</p>
+      </div>
+    );
+  }
+
+  // User list
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+      <Card style={{ padding: "10px 14px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <Label>Toplam Kullanici</Label>
+          <span style={{ fontFamily: "var(--mono)", fontSize: "20px", fontWeight: "700", color: "var(--acc)" }}>{users.length}</span>
+        </div>
+      </Card>
+
+      {users.length === 0 && (
+        <p style={{ fontFamily: "var(--mono)", fontSize: "11px", color: "var(--muted)", textAlign: "center", padding: "30px" }}>
+          Henuz kullanici yok. Kullanicilar giris yapip bir islem yapinca burada gorünür.
+        </p>
+      )}
+
+      {users.map((u) => (
+        <div key={u.uid} onClick={() => selectUser(u.uid)}
+          style={{ padding: "12px 14px", background: "var(--s1)", border: "1px solid var(--b1)", borderRadius: "10px", cursor: "pointer", display: "flex", alignItems: "center", gap: "12px" }}
+          onMouseEnter={(e) => e.currentTarget.style.borderColor = "var(--acc)44"}
+          onMouseLeave={(e) => e.currentTarget.style.borderColor = "var(--b1)"}>
+          {u.photoURL
+            ? <img src={u.photoURL} alt="" style={{ width: "32px", height: "32px", borderRadius: "50%", flexShrink: 0 }} />
+            : <div style={{ width: "32px", height: "32px", borderRadius: "50%", background: "var(--b2)", flexShrink: 0 }} />}
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <p style={{ fontSize: "13px", fontWeight: "500" }}>{u.displayName || "--"}</p>
+            <p style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)", marginTop: "1px" }}>{u.email}</p>
+          </div>
+          <div style={{ display: "flex", gap: "10px", flexShrink: 0 }}>
+            {[
+              { l: "XP",  v: u.xp      || 0, c: "var(--pur)" },
+              { l: "🔥",  v: u.streak  || 0, c: "var(--acc)" },
+              { l: "den", v: u.trialCount || 0, c: "var(--blu)" },
+            ].map((x) => (
+              <div key={x.l} style={{ textAlign: "center" }}>
+                <p style={{ fontFamily: "var(--mono)", fontSize: "13px", fontWeight: "700", color: x.c }}>{x.v}</p>
+                <p style={{ fontSize: "8px", color: "var(--muted)" }}>{x.l}</p>
+              </div>
+            ))}
+          </div>
+          <div style={{ textAlign: "right", flexShrink: 0 }}>
+            <p style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)" }}>{fmtTs(u.lastSeen)}</p>
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
