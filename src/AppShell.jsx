@@ -1282,7 +1282,14 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
       toast("Tamamlanmış blok silinemez.", "var(--red)");
       return;
     }
-    setPlans((p) => ({ ...p, [today]: (p[today] || []).filter((x) => x.id !== id) }));
+    // Sadece localStorage'a yaz -- store.save yerine doğrudan
+    // Böylece _writeSummary tetiklenmez, plan_done kontrolü çalışmaz
+    setPlansRaw((p) => {
+      const next = { ...p, [today]: (p[today] || []).filter((x) => x.id !== id) };
+      try { localStorage.setItem(KEYS.plan, JSON.stringify(next)); } catch { /* ignore */ }
+      if (_syncUid) fsSave(_syncUid, KEYS.plan, next);
+      return next;
+    });
   };
 
   const totalPlanned  = todayPlan.reduce((s, x) => s + (x.durationMin || 0), 0);
