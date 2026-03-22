@@ -44,20 +44,20 @@ const fmtTs = (ts) => {
   if (!ts) return "--";
   const d = ts.seconds ? new Date(ts.seconds * 1000) : new Date(ts);
   const diff = Math.floor((Date.now() - d.getTime()) / 60000);
-  if (diff < 2)    return "az once";
-  if (diff < 60)   return `${diff}dk once`;
-  if (diff < 1440) return `${Math.floor(diff / 60)}s once`;
-  return `${Math.floor(diff / 1440)}g once`;
+  if (diff < 2)    return "Son görülme: az önce";
+  if (diff < 60)   return `Son görülme: ${diff} dakika önce`;
+  if (diff < 1440) return `Son görülme: ${Math.floor(diff / 60)} saat önce`;
+  return `Son görülme: ${Math.floor(diff / 1440)} gün önce`;
 };
 
 const fmtDate = (iso) => {
   if (!iso) return "--";
   const d = new Date(iso);
   const diff = Math.floor((Date.now() - d.getTime()) / 86400000);
-  if (diff === 0) return "bugun";
-  if (diff === 1) return "dun";
-  if (diff < 7)  return `${diff}g once`;
-  if (diff < 30) return `${Math.floor(diff / 7)}h once`;
+  if (diff === 0) return "bugün";
+  if (diff === 1) return "dün";
+  if (diff < 7)  return `${diff} gün önce`;
+  if (diff < 30) return `${Math.floor(diff / 7)} hafta önce`;
   return d.toLocaleDateString("tr-TR", { day: "2-digit", month: "short" });
 };
 
@@ -141,12 +141,14 @@ const CSS = `
   ::-webkit-scrollbar { width: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: ${T.border}; border-radius: 4px; }
-  @keyframes fadeUp  { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:none; } }
-  @keyframes fadeIn  { from { opacity:0; } to { opacity:1; } }
-  @keyframes spin    { to { transform: rotate(360deg); } }
-  @keyframes blink   { 0%,100%{opacity:1} 50%{opacity:.3} }
+  @keyframes fadeUp    { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:none; } }
+  @keyframes fadeIn    { from { opacity:0; } to { opacity:1; } }
+  @keyframes spin      { to { transform: rotate(360deg); } }
+  @keyframes blink     { 0%,100%{opacity:1} 50%{opacity:.3} }
+  @keyframes barGrow   { from { width: 0%; } to { width: var(--bar-w); } }
   .card-enter { animation: fadeUp .18s ease both; }
   .fade-in    { animation: fadeIn .15s ease both; }
+  .pbar-fill  { animation: barGrow .6s cubic-bezier(.4,0,.2,1) both; }
 `;
 
 // ============================================================================
@@ -169,14 +171,22 @@ const Spinner = () => (
 
 const PBar = ({ value, max, color, h = 5 }) => {
   const pct = max > 0 ? Math.min((value / max) * 100, 100) : 0;
+  const pctStr = `${pct.toFixed(1)}%`;
+  // Gradient: lighten the fill slightly toward right for depth
+  const grad = `linear-gradient(90deg, ${color}cc, ${color})`;
   return (
     <div style={{ height: h, background: T.border, borderRadius: 999, overflow: "hidden" }}>
-      <div style={{
-        height: "100%", width: `${pct}%`,
-        background: color,
-        borderRadius: 999,
-        transition: "width .5s cubic-bezier(.4,0,.2,1)",
-      }} />
+      <div
+        className="pbar-fill"
+        style={{
+          "--bar-w": pctStr,
+          height: "100%",
+          width: pctStr,
+          background: grad,
+          borderRadius: 999,
+          boxShadow: `0 0 6px ${color}44`,
+        }}
+      />
     </div>
   );
 };
@@ -217,6 +227,24 @@ const Btn = ({ children, onClick, variant = "ghost", disabled, style }) => {
   );
 };
 
+// Human-readable risk reason generator (max 3, priority ordered)
+function riskReasons(flags, stale) {
+  const priority = ["no_checkin_3d", "no_trial_7d", "plan_rate_low", "no_login_2d", "streak_broken"];
+  const HUMAN = {
+    no_checkin_3d: "Son 3 gündür check-in yapılmamış",
+    no_trial_7d:   "Son 7 gündür deneme girilmemiş",
+    plan_rate_low: "Plan uyumu %40'ın altında",
+    no_login_2d:   "Son 2 gündür uygulamaya girilmemiş",
+    streak_broken: "Çalışma serisi sıfırlanmış",
+  };
+  const items = priority
+    .filter((f) => flags.includes(f))
+    .map((f) => HUMAN[f])
+    .slice(0, stale ? 2 : 3);
+  if (stale && items.length < 3) items.push("Veriler güncel olmayabilir");
+  return items.slice(0, 3);
+}
+
 // ============================================================================
 // StudentCard
 // ============================================================================
@@ -225,10 +253,44 @@ function StudentCard({ student, onClick }) {
   const color = riskColor(risk.level);
   const stale = isSyncStale(student);
 
-  // Last trial display
-  const lastTrialText = student.lastTrialDate
+  // Plan adherence with minute context
+  const adherRate    = risk.adherenceRate;
+  const adherColor_  = adherColor(adherRate);
+  // Estimate worked/target from stored summary (best effort from adherenceRate)
+  // We don't have raw minutes in summary, so display % with context warning
+  const lowActivity  = (student.weeklyActiveDays ?? 0) <= 1;
+  const fakeHundred  = adherRate === 100 && (student.validWorkedMin ?? 999) < 60;
+  const misleading   = adherRate >= 80 && lowActivity;
+
+  // Chip system: max 3, ordered by severity, +N overflow
+  const FLAG_ORDER   = ["no_checkin_3d", "plan_rate_low", "no_trial_7d", "no_login_2d", "streak_broken"];
+  const FLAG_COLOR   = {
+    no_checkin_3d: T.high, plan_rate_low: T.high,
+    no_trial_7d:   T.mid,  no_login_2d:   T.mid,
+    streak_broken: T.muted,
+  };
+  const orderedFlags = FLAG_ORDER.filter((f) => risk.flags.includes(f));
+  const visibleFlags = orderedFlags.slice(0, 3);
+  const extraCount   = orderedFlags.length - visibleFlags.length + (stale ? 1 : 0);
+
+  // Risk reasons block
+  const reasons = (risk.level === "high" || risk.level === "mid")
+    ? riskReasons(risk.flags, stale)
+    : [];
+
+  // Last trial
+  const hasTrial     = !!student.lastTrialDate;
+  const trialLabel   = hasTrial
     ? `${student.lastTrialNet ?? "--"} net · ${fmtDate(student.lastTrialDate)}`
-    : "Deneme yok";
+    : "Henüz deneme girilmemiş";
+
+  // Stale sync label
+  const staleDays = stale && student.syncedAt
+    ? Math.floor((Date.now() - (student.syncedAt?.seconds ? student.syncedAt.seconds * 1000 : new Date(student.syncedAt).getTime())) / 86400000)
+    : null;
+  const staleLabel = staleDays !== null
+    ? `Son senkron: ${staleDays} gün önce`
+    : "Hiç senkronize edilmemiş";
 
   return (
     <div className="card-enter"
@@ -240,13 +302,13 @@ function StudentCard({ student, onClick }) {
         borderRadius: "12px",
         overflow: "hidden",
         cursor: "pointer",
-        transition: "transform .12s, border-color .12s, box-shadow .12s",
+        transition: "transform .15s, border-color .15s, box-shadow .15s",
         position: "relative",
       }}
       onMouseEnter={(e) => {
-        e.currentTarget.style.transform = "translateY(-1px)";
-        e.currentTarget.style.borderColor = `${T.acc}55`;
-        e.currentTarget.style.boxShadow = `0 4px 24px rgba(108,99,255,.08)`;
+        e.currentTarget.style.transform = "translateY(-3px)";
+        e.currentTarget.style.borderColor = `${T.acc}66`;
+        e.currentTarget.style.boxShadow = `0 8px 32px rgba(108,99,255,.12)`;
       }}
       onMouseLeave={(e) => {
         e.currentTarget.style.transform = "none";
@@ -259,84 +321,117 @@ function StudentCard({ student, onClick }) {
 
       {/* Content */}
       <div style={{ flex: 1, padding: "16px 18px", minWidth: 0 }}>
-        {/* Top row */}
-        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: "12px", gap: "12px" }}>
+
+        {/* TOP: Avatar + Name + Risk badge */}
+        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: "14px", gap: "12px" }}>
           <div style={{ display: "flex", alignItems: "center", gap: "10px", minWidth: 0 }}>
-            {/* Avatar */}
             {student.photoURL
               ? <img src={student.photoURL} alt="" style={{ width: 36, height: 36, borderRadius: "50%", flexShrink: 0, border: `2px solid ${T.border}` }} />
-              : <div style={{
-                  width: 36, height: 36, borderRadius: "50%", flexShrink: 0,
-                  background: `${color}20`, border: `2px solid ${color}40`,
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                  fontSize: "14px", fontWeight: 700, color,
-                }}>
+              : <div style={{ width: 36, height: 36, borderRadius: "50%", flexShrink: 0, background: `${color}20`, border: `2px solid ${color}40`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "14px", fontWeight: 700, color }}>
                   {(student.displayName || "?")[0].toUpperCase()}
                 </div>
             }
             <div style={{ minWidth: 0 }}>
               <p style={{ fontWeight: 600, fontSize: "14px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: T.txt }}>
-                {student.displayName || student.email || "Isimsiz"}
+                {student.displayName || student.email || "İsimsiz"}
               </p>
               <p style={{ fontSize: "12px", color: T.sub, marginTop: "2px" }}>
-                {student.groupId ? `Grup: ${student.groupId}` : "Grup atanmadi"}
+                {student.groupId ? `Grup: ${student.groupId}` : "Grup atanmadı"}
                 {" · "}
                 {fmtTs(student.lastSeen)}
               </p>
             </div>
           </div>
-          {/* Risk badge */}
           <span style={{
-            fontSize: "11px", fontWeight: 600,
-            padding: "4px 10px", borderRadius: "20px",
+            fontSize: "11px", fontWeight: 600, padding: "4px 10px", borderRadius: "20px",
             background: `${color}15`, color, border: `1px solid ${color}30`,
             flexShrink: 0, letterSpacing: ".02em",
           }}>
-            {risk.level === "high" ? "Riskli" : risk.level === "mid" ? "Dikkat" : "Iyi"}
+            {risk.level === "high" ? "Riskli" : risk.level === "mid" ? "Dikkat" : "İyi"}
           </span>
         </div>
 
-        {/* Middle: trial + plan */}
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "12px" }}>
-          {/* Last trial */}
+        {/* MIDDLE PRIMARY: Plan Uyumu - visually dominant */}
+        <div style={{ marginBottom: "12px", padding: "12px 14px", background: "#0D0D15", borderRadius: "10px", border: `1px solid ${T.border}` }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: "8px" }}>
+            <p style={{ fontSize: "11px", color: T.muted, textTransform: "uppercase", letterSpacing: ".08em", fontWeight: 600 }}>
+              Plan Uyumu
+            </p>
+            <div style={{ textAlign: "right" }}>
+              {fakeHundred ? (
+                <p style={{ fontSize: "12px", color: T.mid, fontWeight: 600 }}>⚠️ Yetersiz veri</p>
+              ) : (
+                <p style={{ fontSize: "18px", fontWeight: 700, color: adherColor_, lineHeight: 1 }}>
+                  %{adherRate}
+                </p>
+              )}
+            </div>
+          </div>
+          <PBar value={adherRate} max={100} color={adherColor_} h={10} />
+          {misleading && !fakeHundred && (
+            <p style={{ fontSize: "11px", color: T.mid, marginTop: "6px" }}>
+              ⚠️ Aktivite düşük - veri yanıltıcı olabilir
+            </p>
+          )}
+        </div>
+
+        {/* BOTTOM row: Son Deneme + Hafta Aktif */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", marginBottom: reasons.length > 0 ? "12px" : "0" }}>
           <div>
-            <p style={{ fontSize: "11px", color: T.muted, marginBottom: "3px", textTransform: "uppercase", letterSpacing: ".06em", fontWeight: 600 }}>Son Deneme</p>
-            <p style={{ fontSize: "13px", color: student.lastTrialDate ? T.txt : T.muted, fontWeight: student.lastTrialDate ? 500 : 400 }}>
-              {lastTrialText}
+            <p style={{ fontSize: "10px", color: T.muted, marginBottom: "3px", textTransform: "uppercase", letterSpacing: ".06em", fontWeight: 600 }}>Son Deneme</p>
+            <p style={{ fontSize: "12px", color: hasTrial ? T.txt : T.muted, fontWeight: hasTrial ? 500 : 400 }}>
+              {trialLabel}
             </p>
           </div>
-          {/* Weekly activity */}
           <div>
-            <p style={{ fontSize: "11px", color: T.muted, marginBottom: "3px", textTransform: "uppercase", letterSpacing: ".06em", fontWeight: 600 }}>Hafta Aktif</p>
-            <p style={{ fontSize: "13px", color: T.txt, fontWeight: 500 }}>
+            <p style={{ fontSize: "10px", color: T.muted, marginBottom: "3px", textTransform: "uppercase", letterSpacing: ".06em", fontWeight: 600 }}>Hafta Aktif</p>
+            <p style={{ fontSize: "12px", color: T.txt, fontWeight: 500 }}>
               {student.weeklyActiveDays ?? 0}
-              <span style={{ color: T.muted, fontWeight: 400 }}>/7 gun</span>
+              <span style={{ color: T.muted, fontWeight: 400 }}>/7 gün</span>
             </p>
           </div>
         </div>
 
-        {/* Plan adherence bar */}
-        <div style={{ marginBottom: "10px" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "5px" }}>
-            <p style={{ fontSize: "11px", color: T.muted, textTransform: "uppercase", letterSpacing: ".06em", fontWeight: 600 }}>Plan Uyumu</p>
-            <p style={{ fontSize: "12px", fontWeight: 600, color: adherColor(risk.adherenceRate) }}>
-              %{risk.adherenceRate}
+        {/* Risk reason block */}
+        {reasons.length > 0 && (
+          <div style={{ padding: "9px 12px", background: `${color}08`, border: `1px solid ${color}20`, borderRadius: "8px", marginBottom: "10px" }}>
+            <p style={{ fontSize: "10px", color: T.muted, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".06em", marginBottom: "5px" }}>
+              Risk nedeni
             </p>
+            {reasons.map((r, i) => (
+              <p key={i} style={{ fontSize: "12px", color: T.sub, lineHeight: 1.6 }}>• {r}</p>
+            ))}
           </div>
-          <PBar value={risk.adherenceRate} max={100} color={adherColor(risk.adherenceRate)} h={4} />
-        </div>
+        )}
 
-        {/* Bottom: flags */}
-        {(risk.flags.length > 0 || stale) && (
-          <div style={{ display: "flex", gap: "5px", flexWrap: "wrap" }}>
-            {risk.flags.map((f) => {
-              const meta  = FLAG_META[f] || { label: f };
-              const fc    = f === "plan_rate_low" || f === "no_checkin_3d" ? T.high
-                          : f === "no_trial_7d"   || f === "no_login_2d"  ? T.mid
-                          : T.muted;
-              return <Chip key={f} label={meta.label} color={fc} />;
+        {/* Chips: max 3 + overflow count */}
+        {(visibleFlags.length > 0 || stale) && (
+          <div style={{ display: "flex", gap: "4px", flexWrap: "wrap", alignItems: "center" }}>
+            {visibleFlags.map((f) => {
+              const meta = FLAG_META[f] || { label: f };
+              const fc   = FLAG_COLOR[f] || T.muted;
+              return (
+                <span key={f} style={{
+                  display: "inline-flex", alignItems: "center",
+                  fontSize: "10px", fontWeight: 500,
+                  padding: "2px 7px", borderRadius: "5px",
+                  background: `${fc}15`, color: fc, border: `1px solid ${fc}28`,
+                  whiteSpace: "nowrap",
+                }}>
+                  {meta.label}
+                </span>
+              );
             })}
-            {stale && <Chip label="Veri eski" color={T.muted} />}
+            {extraCount > 0 && (
+              <span style={{ fontSize: "10px", color: T.muted, padding: "2px 6px", background: T.border, borderRadius: "5px" }}>
+                +{extraCount}
+              </span>
+            )}
+            {stale && visibleFlags.length < 3 && (
+              <span style={{ fontSize: "10px", color: T.mid, padding: "2px 7px", background: `${T.mid}12`, border: `1px solid ${T.mid}25`, borderRadius: "5px", display: "inline-flex", alignItems: "center", gap: "4px" }}>
+                ⚠️ {staleLabel}
+              </span>
+            )}
           </div>
         )}
       </div>
@@ -462,7 +557,7 @@ function WeeklyPlanBreakdown({ studentUid }) {
                 </span>
                 {rate !== null
                   ? <span style={{ fontSize: "12px", fontWeight: 600, color: dc }}>{doneMin}dk / {totalMin}dk · %{rate}</span>
-                  : <span style={{ fontSize: "12px", color: T.muted }}>plan yok</span>
+                  : <span style={{ fontSize: "12px", color: T.muted }}>Bu gün için plan oluşturulmamış</span>
                 }
               </div>
               {items.length > 0 && (
@@ -771,11 +866,16 @@ function StudentDetailModal({ student, counselorUid, onClose }) {
 
           {/* Plan adherence bar */}
           <div style={{ marginBottom: "4px" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "5px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "5px" }}>
               <span style={{ fontSize: "12px", color: T.muted, textTransform: "uppercase", letterSpacing: ".06em", fontWeight: 600 }}>Plan Uyumu (7g)</span>
-              <span style={{ fontSize: "12px", fontWeight: 600, color: adherColor(risk.adherenceRate) }}>%{risk.adherenceRate}</span>
+              <div style={{ textAlign: "right" }}>
+                <span style={{ fontSize: "18px", fontWeight: 700, color: adherColor(risk.adherenceRate) }}>%{risk.adherenceRate}</span>
+                {risk.adherenceRate >= 80 && (student.weeklyActiveDays ?? 0) <= 1 && (
+                  <p style={{ fontSize: "10px", color: T.mid, marginTop: "1px" }}>⚠️ Aktivite düşük</p>
+                )}
+              </div>
             </div>
-            <PBar value={risk.adherenceRate} max={100} color={adherColor(risk.adherenceRate)} h={5} />
+            <PBar value={risk.adherenceRate} max={100} color={adherColor(risk.adherenceRate)} h={10} />
           </div>
 
           {/* Tab bar */}
@@ -1033,7 +1133,7 @@ export default function CounselorDashboard({ profile, user, onSignOut, onSwitchT
                 <input
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
-                  placeholder="Ogrenci ara..."
+                  placeholder="İsim ile ara..."
                   style={{ width: "100%", padding: "8px 12px 8px 34px", borderRadius: "9px", fontSize: "13px" }}
                 />
               </div>
