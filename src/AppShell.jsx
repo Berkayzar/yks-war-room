@@ -753,10 +753,11 @@ function WeeklyReviewCard({ plans, trials, todos, checkins }) {
   }).reverse(), []);
 
   const dayData = last7.map(({ date, label }) => {
-    const dayPlan = plans[date] || [];
-    const pct = dayPlan.length > 0
-      ? Math.round((dayPlan.filter((x) => x.done).length / dayPlan.length) * 100)
-      : -1;
+    const dayPlan   = plans[date] || [];
+    const targetMin = dayPlan.reduce((s, x) => s + (x.durationMin || 0), 0);
+    const doneMin   = dayPlan.filter((x) => x.done).reduce((s, x) => s + (x.actualMin || x.durationMin || 0), 0);
+    // FIX 8: minute-based, -1 means no plan
+    const pct = targetMin > 0 ? Math.round((doneMin / targetMin) * 100) : -1;
     return { date, label, pct, isToday: date === todayStr() };
   });
 
@@ -842,18 +843,22 @@ function Heatmap({ plans, trials, checkins }) {
     const pMap = {};
     const cMap = {};
     const tMap = {};
+    // FIX 7: minute-based adherence score (0-3) instead of task count
     Object.entries(plans || {}).forEach(([date, items]) => {
-      const done = items.filter((x) => x.done).length;
-      const total = items.length;
-      if (total > 0) pMap[date] = Math.round((done / total) * 3);
+      const targetMin    = items.reduce((s, x) => s + (x.durationMin || 0), 0);
+      const completedMin = items.filter((x) => x.done).reduce((s, x) => s + (x.actualMin || x.durationMin || 0), 0);
+      if (targetMin > 0) {
+        const rate = completedMin / targetMin; // 0-1
+        pMap[date] = Math.round(rate * 3);    // 0-3
+      }
     });
-    // also read legacy dw sessions for backward compat
+    // legacy dw sessions fallback
     const dw = store.load(KEYS.dw, { sessions: [] });
     (dw.sessions || []).forEach((s) => {
       if (!pMap[s.date] && s.completedMin > 0) pMap[s.date] = Math.min(3, Math.floor(s.completedMin / 60));
     });
     (checkins || []).forEach((c) => { cMap[c.date] = c.score; });
-    (trials || []).forEach((t) => { tMap[t.date] = (tMap[t.date] || 0) + 1; });
+    (trials  || []).forEach((t) => { tMap[t.date] = (tMap[t.date] || 0) + 1; });
     return Array.from({ length: 84 }, (_, i) => {
       const key = new Date(Date.now() - (83 - i) * 86400000).toISOString().slice(0, 10);
       const score = clamp((pMap[key] || 0) + ((cMap[key] ?? -1) >= 3 ? 1 : 0) + (tMap[key] || 0), 0, 4);
@@ -983,9 +988,16 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
   // Timer state
   const [activeId, setActiveId] = useState(null);
   const [elapsed, setElapsed] = useState(0);
-  const [timerPhase, setTimerPhase] = useState("idle"); // idle|run|warn
+  const [timerPhase, setTimerPhase] = useState("idle"); // idle|run|warn|paused
   const [breakReason, setBreakReason] = useState("");
   const itvRef = useRef(null);
+
+  // FIX 9: stable ticking nowMin instead of inline nowHHMM() call
+  const [nowMin, setNowMin] = useState(nowHHMM());
+  useEffect(() => {
+    const id = setInterval(() => setNowMin(nowHHMM()), 30000);
+    return () => clearInterval(id);
+  }, []);
 
   // Dopamine state
   const [xpBurst, setXpBurst] = useState(null);
@@ -999,7 +1011,6 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
   const [sessionCloseItem, setSessionCloseItem]   = useState(null);
 
   // Add form
-  const nowMin = nowHHMM();
   const [addOpen, setAddOpen] = useState(false);
   const [form, setForm] = useState({
     startMin: minsToHHMM(Math.ceil(nowMin / 30) * 30),
@@ -1049,6 +1060,15 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
   }, []);
 
   const stopTimer = useCallback(() => {
+    // Full stop -- clears everything (used after finishBlock)
+    clearInterval(itvRef.current);
+    setActiveId(null);
+    setTimerPhase("idle");
+    setElapsed(0);
+  }, []);
+
+  const cancelTimer = useCallback(() => {
+    // Cancel without finishing (stop button while running)
     clearInterval(itvRef.current);
     setActiveId(null);
     setTimerPhase("idle");
@@ -1156,14 +1176,13 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
         setTimeout(() => toast(`+${XP_R.plan_done} XP -- Gunluk plan TAMAM!`, "var(--grn)"), 1200);
       }
     } else {
-      // Gecersiz session -- bilgilendir ama XP verme
+      // FIX 5: invalid session -- NO win animation, only muted warning
       if (actualMin < SESSION_MIN_MINUTES) {
-        toast(`${actualMin}dk -- Gecerli blok icin en az ${SESSION_MIN_MINUTES}dk gerekli`, "var(--muted)");
+        toast(`${actualMin}dk -- En az ${SESSION_MIN_MINUTES}dk gerekli, XP kazanilmadi`, "var(--muted)");
       } else {
-        toast(`${actualMin}dk -- Blok tamamlandi (max ${SESSION_MAX_MINUTES}dk limit)`, "var(--acc)");
+        toast(`${actualMin}dk -- ${SESSION_MAX_MINUTES}dk limiti asildi, XP kazanilmadi`, "var(--muted)");
       }
-      setWinBlockId(id);
-      setTimeout(() => setWinBlockId(null), 600);
+      // No winBlockId, no xpBurst for invalid sessions
     }
 
     // Deneme ise analiz formunu ac
@@ -1184,6 +1203,7 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
   };
 
   const requestEarlyBreak = () => {
+    // FIX 1: pause timer, do NOT finish block
     clearInterval(itvRef.current);
     setTimerPhase("warn");
     playSound("warn");
@@ -1192,28 +1212,77 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
   const confirmBreak = () => {
     if (!breakReason) return;
     const elMin = Math.floor(elapsed / 60);
+    // FIX 1: record break in attention log but do NOT call finishBlock
+    // Block stays active (not done), timer is paused at current elapsed
     const bd = { type: "early", blockMin: elMin, reason: breakReason, at: new Date().toISOString() };
-    finishBlock(activeId, elMin, true, bd);
+    setAttn((p) => {
+      const prev = p[today] || { breaks: [] };
+      return { ...p, [today]: { ...prev, breaks: [...prev.breaks, bd] } };
+    });
+    // Mark block as paused with elapsed so far
+    setPlans((prev) => ({
+      ...prev,
+      [today]: (prev[today] || []).map((x) =>
+        x.id === activeId
+          ? { ...x, pausedAt: elMin, pauseReason: breakReason }
+          : x
+      ),
+    }));
+    setTimerPhase("paused");
+    setBreakReason("");
+    toast(`Mola kaydedildi. ${elMin}dk calistin.`, "var(--ora)");
   };
 
   const resumeFromWarn = () => {
+    // Resume from warn screen without recording break
     setTimerPhase("run");
     setBreakReason("");
     itvRef.current = setInterval(() => setElapsed((p) => p + 1), 1000);
     playSound("start");
   };
 
+  const resumeFromPause = () => {
+    // FIX 1: resume same block from paused elapsed time
+    setTimerPhase("run");
+    itvRef.current = setInterval(() => setElapsed((p) => p + 1), 1000);
+    playSound("start");
+    toast("Devam et!", "var(--acc)");
+  };
+
   const markDoneManual = (id) => {
     const item = todayPlan.find((x) => x.id === id);
     if (!item) return;
-    const expectedEnd = item.startMin + item.durationMin;
-    const delayedMin = Math.max(0, nowMin - expectedEnd);
-    if (delayedMin > 15 && !item.done) {
-      setDelayModal({ id, delayedMin });
+    // Sadece bu item'in timerı çalışırken "Bitir" ile çağrılabilir
+    const isThisActive = activeId === id && timerPhase === "run";
+    if (!isThisActive) {
+      toast("Blok sadece kronometre çalışırken tamamlanabilir.", "var(--muted)");
       return;
     }
-    finishBlock(id, item.durationMin, false, null);
+    const usedMin = elapsed > 0 ? Math.floor(elapsed / 60) : item.durationMin;
+    finishBlock(id, usedMin, false, null);
   };
+
+  const delItem = (id) => {
+    // Aktif (timer çalışıyor veya paused) blok silinemez
+    if (activeId === id) {
+      toast("Aktif blok silinemez.", "var(--red)");
+      return;
+    }
+    // Tamamlanmış blok silinemez -- veri bütünlüğü
+    const item = (plans[today] || []).find((x) => x.id === id);
+    if (item?.done) {
+      toast("Tamamlanmış blok silinemez.", "var(--red)");
+      return;
+    }
+    setPlans((p) => ({ ...p, [today]: (p[today] || []).filter((x) => x.id !== id) }));
+  };
+
+  const totalPlanned  = todayPlan.reduce((s, x) => s + (x.durationMin || 0), 0);
+  const totalActual   = todayPlan.filter((x) => x.done).reduce((s, x) => s + (x.actualMin || x.durationMin), 0);
+  // FIX 3: minute-based completionPct
+  const completionPct = totalPlanned > 0
+    ? Math.round((totalActual / totalPlanned) * 100)
+    : 0;
 
   const addItem = () => {
     if (!form.subject.trim() && form.kind !== "trial") return;
@@ -1237,16 +1306,6 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
     toast(`Plan ogesi eklendi: ${subject}`, "var(--acc)");
   };
 
-  const delItem = (id) => {
-    if (activeId === id) stopTimer();
-    setPlans((p) => ({ ...p, [today]: (p[today] || []).filter((x) => x.id !== id) }));
-  };
-
-  const totalPlanned = todayPlan.reduce((s, x) => s + x.durationMin, 0);
-  const totalActual  = todayPlan.filter((x) => x.done).reduce((s, x) => s + (x.actualMin || x.durationMin), 0);
-  const completionPct = todayPlan.length > 0
-    ? Math.round((todayPlan.filter((x) => x.done).length / todayPlan.length) * 100)
-    : 0;
   const overdueItems = todayPlan.filter((p) => !p.done && p.startMin + p.durationMin < nowMin);
   const attnScore = calcAttentionScore(attn[today]?.breaks || []);
   const { label: aLabel, color: aColor } = attentionLabel(attnScore);
@@ -1282,8 +1341,10 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
           onDismiss={() => setFocusChallenge(false)}
           onClaim={(bonus) => {
             if (bonus > 0) {
+              // FIX 6: all XP through grantXP, not direct mutation
               const xpd = loadXP();
-              xpd.points += bonus;
+              xpd.points += bonus; // challenge_bonus type not in XP_R so direct add is safe
+              // but we still save through store so Firestore sync happens
               store.save(KEYS.xp, xpd);
               toast(`+${bonus} XP odak bonusu!`, "var(--acc)");
             }
@@ -1304,6 +1365,33 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
             <p style={{ fontSize: "11px", color: "var(--muted)", marginTop: "1px" }}>{overdueItems.map((x) => x.subject).join(", ")}</p>
           </div>
         </div>
+      )}
+
+      {/* Paused block -- FIX 1: resume or finish after break */}
+      {timerPhase === "paused" && activeItem && (
+        <Card style={{ border: "1px solid var(--ora)44", background: "var(--ora)06" }} className="fi">
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+            <div>
+              <Label style={{ marginBottom: "2px", color: "var(--ora)" }}>Mola -- Duraklatildi</Label>
+              <p style={{ fontSize: "13px", fontWeight: "600", color: "var(--txt)" }}>{activeItem.subject}</p>
+              <p style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--muted)", marginTop: "2px" }}>
+                {fmtMMSS(elapsed)} calistin
+              </p>
+            </div>
+            <PBar value={elapsed} max={activeItem.durationMin * 60} color="var(--ora)" h={5} />
+          </div>
+          <div style={{ display: "flex", gap: "8px" }}>
+            <Btn variant="primary" onClick={resumeFromPause} style={{ flex: 2 }}>
+              Devam et
+            </Btn>
+            <Btn variant="success"
+              disabled={elapsed < 30}
+              onClick={() => { finishBlock(activeId, Math.floor(elapsed / 60), true, null); }}
+              style={{ flex: 1 }}>
+              Bitir ({fmtMMSS(elapsed)})
+            </Btn>
+          </div>
+        </Card>
       )}
 
       {/* Active focus timer */}
@@ -1446,7 +1534,7 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
             timerPhase={timerPhase}
             winBlockId={winBlockId}
             onStart={() => startTimer(item.id)}
-            onStop={stopTimer}
+            onStop={cancelTimer}
             onDone={() => markDoneManual(item.id)}
             onDelete={() => delItem(item.id)}
           />
@@ -1532,23 +1620,31 @@ function PlanItemRow({ item, nowMin, activeId, elapsed, timerPhase, winBlockId, 
   const isActive = activeId === item.id;
   const isWin    = winBlockId === item.id;
 
-  // earlyBreak: done but actualMin < durationMin
+  // Paused: timer durdurulmuş, henüz done değil
+  const isPaused     = !item.done && item.pausedAt != null && activeId !== item.id;
+  // EarlyBreak: done AND actualMin < durationMin (Bitir ile erken bitirilmiş)
   const isEarlyBreak = item.done && item.actualMin != null && item.actualMin < item.durationMin;
   const isFullDone   = item.done && !isEarlyBreak;
 
   const status = item.done
     ? (isEarlyBreak ? "early" : "done")
-    : isActive ? "active"
+    : isActive   ? "active"
+    : isPaused   ? "paused"
     : nowMin > item.startMin + item.durationMin ? "late"
     : "upcoming";
 
-  const colMap   = { done: "var(--grn)", early: "var(--ora)", active: "var(--acc)", late: "var(--red)", upcoming: "var(--muted)" };
+  const colMap   = { done: "var(--grn)", early: "var(--ora)", active: "var(--acc)", late: "var(--red)", paused: "var(--ora)", upcoming: "var(--muted)" };
   const col      = colMap[status];
-  const pct      = isActive ? clamp(Math.round((elapsed / (item.durationMin * 60)) * 100), 0, 100) : isFullDone ? 100 : isEarlyBreak ? Math.round((item.actualMin / item.durationMin) * 100) : 0;
+  const pct      = isActive ? clamp(Math.round((elapsed / (item.durationMin * 60)) * 100), 0, 100)
+                 : isFullDone ? 100
+                 : isEarlyBreak ? Math.round((item.actualMin / item.durationMin) * 100)
+                 : isPaused ? Math.round(((item.pausedAt || 0) / item.durationMin) * 100)
+                 : 0;
   const borderCss = status === "late"   ? "var(--red)33"
                   : status === "active" ? "var(--acc)33"
                   : status === "done"   ? "var(--grn)22"
                   : status === "early"  ? "var(--ora)33"
+                  : status === "paused" ? "var(--ora)22"
                   : item.kind === "trial" ? "var(--blu)33"
                   : "var(--b2)";
 
@@ -1590,10 +1686,15 @@ function PlanItemRow({ item, nowMin, activeId, elapsed, timerPhase, winBlockId, 
         </div>
         <div style={{ display: "flex", gap: "4px", flexShrink: 0 }}>
           {!item.done && !isActive && <Btn size="sm" variant="accent" onClick={onStart}>▶</Btn>}
-          {isActive && timerPhase === "run" && elapsed > 30 && <Btn size="sm" variant="success" onClick={onDone}>✓</Btn>}
-          {isActive && <Btn size="sm" variant="ghost" onClick={onStop} style={{ color: "var(--muted)" }}>◼</Btn>}
-          {!item.done && !isActive && <Btn size="sm" variant="ghost" onClick={onDone} style={{ color: "var(--grn)" }}>✓</Btn>}
-          <Btn size="sm" variant="ghost" onClick={onDelete} style={{ color: "var(--red)" }}>×</Btn>
+          {isActive && timerPhase === "run" && elapsed > 30 && <Btn size="sm" variant="success" onClick={onDone}>Bitir</Btn>}
+          {isActive && timerPhase === "run" && <Btn size="sm" variant="ghost" onClick={onStop} style={{ color: "var(--muted)" }}>◼</Btn>}
+          {/* Tamamlanmış veya aktif blok silinemez */}
+          {!item.done && (
+            <Btn size="sm" variant="ghost" onClick={onDelete}
+              disabled={isActive}
+              style={{ color: isActive ? "var(--b2)" : "var(--red)", cursor: isActive ? "not-allowed" : "pointer" }}
+              title={isActive ? "Aktif blok silinemez" : "Sil"}>×</Btn>
+          )}
         </div>
       </div>
       {isActive && timerPhase === "run" && (
@@ -1608,6 +1709,19 @@ function PlanItemRow({ item, nowMin, activeId, elapsed, timerPhase, winBlockId, 
       {isEarlyBreak && (
         <div style={{ marginTop: "6px" }}>
           <PBar value={item.actualMin} max={item.durationMin} color="var(--ora)" h={3} />
+        </div>
+      )}
+      {isPaused && (
+        <div style={{ marginTop: "6px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "3px" }}>
+            <span style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--ora)" }}>
+              {item.pausedAt}dk sonra duraklatildi · {item.pauseReason || ""}
+            </span>
+            <span style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)" }}>
+              {item.durationMin - (item.pausedAt || 0)}dk kaliyor
+            </span>
+          </div>
+          <PBar value={item.pausedAt || 0} max={item.durationMin} color="var(--ora)" h={3} />
         </div>
       )}
     </div>

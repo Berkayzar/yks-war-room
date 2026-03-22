@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { getGroupStudents, addCounselorNote, getCounselorNotes, adminGetUserData } from "./firebase.js";
+import { getGroupStudents, addCounselorNote, getCounselorNotes, counselorGetUserData } from "./firebase.js";
 
 // ============================================================================
 // Constants
@@ -39,27 +39,25 @@ const fmtDate = (iso) => {
 };
 
 // Compute risk from summary fields
+// FIX 11: only use reliable minute-based adherenceRate, no task-count fallback
 function computeRisk(student) {
-  // Use stored riskFlags/riskScore if fresh (written by student's own session)
   const storedFlags = student.riskFlags || [];
-  const storedScore = student.riskScore != null ? student.riskScore : null;
 
-  // Also derive no_login_2d from lastSeen (only available in counselor context)
+  // Add no_login_2d from lastSeen (only available in counselor context via Firestore)
   const lastSeenMs = student.lastSeen?.seconds
     ? student.lastSeen.seconds * 1000
     : student.lastSeen ? new Date(student.lastSeen).getTime() : 0;
   const loginStale = lastSeenMs > 0 && (Date.now() - lastSeenMs) > 2 * 86400000;
 
-  let flags = [...storedFlags];
+  const flags = [...storedFlags];
   if (loginStale && !flags.includes("no_login_2d")) flags.push("no_login_2d");
 
   const score = flags.reduce((s, f) => s + (RISK_WEIGHTS[f] || 0), 0);
 
-  const adherenceRate = student.adherenceRate != null
+  // FIX 11: only use adherenceRate (minute-based), never task-count fallback
+  const adherenceRate = typeof student.adherenceRate === "number"
     ? student.adherenceRate
-    : (student.planCount > 0
-        ? Math.round((student.planDoneCount || 0) / student.planCount * 100)
-        : 0);
+    : 0; // safe zero -- never fabricate from task count
 
   return {
     flags,
@@ -180,10 +178,11 @@ function StudentCard({ student, onClick }) {
       {/* Stats */}
       <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:"5px", marginBottom:"8px" }}>
         {[
-          { l:"XP",     v: student.xp        || 0,               c:"var(--pur)" },
-          { l:"Streak", v: `🔥${student.streak || 0}`,            c: student.streak > 0 ? "var(--acc)" : "var(--muted)" },
-          { l:"Deneme", v: student.trialCount || 0,               c:"var(--blu)" },
-          { l:"Plan%",  v: `${risk.adherenceRate}%`,              c: risk.adherenceRate >= 70 ? "var(--grn)" : risk.adherenceRate >= 40 ? "var(--acc)" : "var(--red)" },
+          // FIX 10: weeklyActiveDays more useful than XP for counselor
+          { l:"Haf.Gun", v: student.weeklyActiveDays ?? "--",        c: (student.weeklyActiveDays||0) >= 5 ? "var(--grn)" : (student.weeklyActiveDays||0) >= 3 ? "var(--acc)" : "var(--red)" },
+          { l:"Streak",  v: `🔥${student.streak || 0}`,             c: student.streak > 0 ? "var(--acc)" : "var(--muted)" },
+          { l:"Deneme",  v: student.trialCount || 0,                 c:"var(--blu)" },
+          { l:"Plan%",   v: `${risk.adherenceRate}%`,                c: risk.adherenceRate >= 70 ? "var(--grn)" : risk.adherenceRate >= 40 ? "var(--acc)" : "var(--red)" },
         ].map((x) => (
           <div key={x.l} style={{ textAlign:"center", padding:"5px 3px", background:"var(--s2)", borderRadius:"5px" }}>
             <p style={{ fontFamily:"var(--mono)", fontSize:"12px", fontWeight:"700", color:x.c, lineHeight:1 }}>{x.v}</p>
@@ -275,6 +274,9 @@ function CounselorNotes({ studentUid, counselorUid }) {
   );
 }
 
+// FIX 12: module-level cache -- keyed by uid, cleared after 5 minutes
+const _planDataCache = {};
+
 // ============================================================================
 // Weekly plan breakdown -- fetches raw yks_plan for a student
 // ============================================================================
@@ -283,7 +285,16 @@ function WeeklyPlanBreakdown({ studentUid }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    adminGetUserData(studentUid).then((d) => {
+    // FIX 12: use cache to avoid refetch on every modal open
+    const cached = _planDataCache[studentUid];
+    if (cached && Date.now() - cached.ts < 5 * 60 * 1000) {
+      setData(cached.data);
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    counselorGetUserData(studentUid).then((d) => {
+      _planDataCache[studentUid] = { data: d, ts: Date.now() };
       setData(d);
       setLoading(false);
     });

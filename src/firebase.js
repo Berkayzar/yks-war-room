@@ -309,6 +309,41 @@ export async function adminGetUsers() {
   } catch { return []; }
 }
 
+// Counselor-safe read: reads yks_plan and yks_trials from user data
+// Requires rules to allow counselor access to users/{uid}/data/{key}
+export async function counselorGetUserData(uid) {
+  if (!uid) return null;
+  try {
+    const COUNSELOR_KEYS = ["yks_plan", "yks_trials", "yks_checkins"];
+    const [dataResults, profileSnap, activitySnap] = await Promise.all([
+      Promise.allSettled(
+        COUNSELOR_KEYS.map((k) =>
+          getDoc(doc(db, "users", uid, "data", k))
+            .then((snap) => [k, snap.exists() ? snap.data().v : null])
+        )
+      ),
+      getDoc(doc(db, "users", uid, "profile", "info")),
+      getDocs(query(
+        collection(db, "users", uid, "activity"),
+        orderBy("at", "desc"),
+        limit(20)
+      )),
+    ]);
+    const data = {};
+    dataResults.forEach((r) => {
+      if (r.status === "fulfilled" && r.value[1] !== null) data[r.value[0]] = r.value[1];
+    });
+    return {
+      data,
+      profile:  profileSnap.exists() ? profileSnap.data() : {},
+      activity: activitySnap.docs.map((d) => ({ id: d.id, ...d.data() })),
+    };
+  } catch (e) {
+    console.error("counselorGetUserData error:", e.code, e.message);
+    return null;
+  }
+}
+
 export async function adminGetUserData(uid) {
   if (!uid) return null;
   try {
@@ -344,20 +379,23 @@ export async function adminGetUserData(uid) {
 // ============================================================================
 
 // Get all userSummaries for a given institution (+ optional group filter)
-// Uses existing userSummaries collection -- no new collection needed
+// Only shows confirmed students (role === 'student' or role not set but has institutionId)
 export async function getGroupStudents(institutionId, groupId) {
   if (!institutionId) return [];
   try {
     const snap = await getDocs(collection(db, "userSummaries"));
     return snap.docs
       .map((d) => ({ uid: d.id, ...d.data() }))
-      .filter((u) =>
-        u.institutionId === institutionId &&
-        u.role !== "counselor" &&
-        u.role !== "institution_admin" &&
-        u.role !== "super_admin" &&
-        (groupId ? u.groupId === groupId : true)
-      );
+      .filter((u) => {
+        // Must belong to this institution
+        if (u.institutionId !== institutionId) return false;
+        // Must be a student role (or unset -- but only if institutionId matches)
+        const role = u.role || "student";
+        if (role === "counselor" || role === "institution_admin" || role === "super_admin") return false;
+        // Optional group filter
+        if (groupId && u.groupId !== groupId) return false;
+        return true;
+      });
   } catch (e) {
     console.error("getGroupStudents error:", e.code, e.message);
     return [];
