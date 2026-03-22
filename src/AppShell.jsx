@@ -12,15 +12,16 @@ import AdminAssignPanel    from "./pages/AdminAssignPanel.jsx";
 // Storage -- localStorage primary, Firestore sync when signed in
 // ============================================================================
 const KEYS = {
-  trials: "yks_trials",
-  todos: "yks_todos",
-  brain: "yks_brain",
-  checkins: "yks_checkins",
-  dw: "yks_dw",
-  xp: "yks_xp",
-  plan: "yks_plan",
-  attn: "yks_attn",
-  challenge: "yks_challenge",
+  trials:       "yks_trials",
+  todos:        "yks_todos",
+  brain:        "yks_brain",
+  checkins:     "yks_checkins",
+  dw:           "yks_dw",
+  xp:           "yks_xp",
+  plan:         "yks_plan",
+  attn:         "yks_attn",
+  challenge:    "yks_challenge",
+  weeklyGoals:  "yks_weekly_goals",  // Plan V2
 };
 
 // Current signed-in uid -- set by App() once auth resolves
@@ -58,35 +59,30 @@ function _writeSummary(uid, user) {
       new Date(now - i * 86400000).toISOString().slice(0, 10)
     );
 
-    // Plan adherence -- minute-based, last 7 days
-    // FIX 10: paused blocks contribute pausedAt minutes to completedMin
+    // Plan adherence -- valid sessions only, paused gets partial credit
     let totalTarget = 0, totalCompleted = 0;
     last7.forEach((d) => {
       (plans[d] || []).forEach((x) => {
-        totalTarget += x.durationMin || 0;
-        if (x.done) {
-          totalCompleted += x.actualMin || x.durationMin || 0;
-        } else if (x.pausedAt && x.pausedAt > 0) {
-          // FIX 10: paused-but-not-finished work still counts toward completion
-          totalCompleted += x.pausedAt;
-        }
+        totalTarget    += x.durationMin || 0;
+        totalCompleted += validWorkedMin(x);  // 0 for invalid sessions
       });
     });
     const adherenceRate = totalTarget > 0
       ? Math.round((totalCompleted / totalTarget) * 100)
       : 0;
 
+    // Plan counts using itemStatus (not item.done)
+    const planItems     = Object.values(plans).flat();
+    const planCount     = planItems.length;
+    const planDoneCount = planItems.filter((x) => itemStatus(x) === "done").length;
+
     // Todo type counts
     const academicTodos = todos.filter((t) => t.todoType === "academic").length;
     const trialTodos    = todos.filter((t) => t.todoType === "trial").length;
     const doneTodos     = todos.filter((t) => t.done).length;
 
-    // Plan counts
-    const planItems     = Object.values(plans).flat();
-    const planCount     = planItems.length;
-    const planDoneCount = planItems.filter((x) => x.done).length;
-
-    // Last trial info
+    // Fix 13: weeklyGoals from localStorage -- sync to Firestore
+    const weeklyGoals = JSON.parse(localStorage.getItem(KEYS.weeklyGoals) || "[]");
     const sortedTrials = [...trials].sort((a, b) => new Date(b.date) - new Date(a.date));
     const lastTrial    = sortedTrials[0] || null;
     const lastTrialDate = lastTrial?.date || null;
@@ -158,6 +154,7 @@ function _writeSummary(uid, user) {
       adherenceRate,
       riskFlags,
       riskScore,
+      weeklyGoals,   // Fix 13: persist to Firestore
     });
   } catch { /* ignore */ }
 }
@@ -166,6 +163,132 @@ function _writeSummary(uid, user) {
 function daysFromDate(isoDate) {
   if (!isoDate) return 999;
   return Math.floor((Date.now() - new Date(isoDate).getTime()) / 86400000);
+}
+
+// ============================================================================
+// Plan V2 helpers
+// ============================================================================
+
+// Canonical status from item -- status is primary, done is legacy fallback
+function itemStatus(item) {
+  if (item.status) return item.status;
+  // backward compat
+  if (item.done)     return "done";
+  if (item.pausedAt) return "paused";
+  return "planned";
+}
+
+// Date relationship helpers
+const isPast   = (dateStr) => dateStr < todayStr();
+const isFuture = (dateStr) => dateStr > todayStr();
+const isToday  = (dateStr) => dateStr === todayStr();
+
+// Get week start (Monday) for a given date string
+function weekMonday(dateStr) {
+  const d   = new Date(dateStr);
+  const day = d.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diff);
+  return d.toISOString().slice(0, 10);
+}
+
+// Get 7 days of a week starting from Monday
+function weekDays(mondayStr) {
+  return Array.from({ length: 7 }, (_, i) => {
+    const d = new Date(mondayStr);
+    d.setDate(d.getDate() + i);
+    return d.toISOString().slice(0, 10);
+  });
+}
+
+// Create a plan item with V2 fields
+function makePlanItem({ subject, startMin, durationMin, kind, trialType, note, date, createdBy = "student" }) {
+  return {
+    id:          uid(),
+    date,
+    subject,
+    topic:       "",
+    startMin,
+    durationMin,
+    kind:        kind || "study",
+    trialType:   kind === "trial" ? trialType : null,
+    note:        note || "",
+    status:      "planned",    // V2 primary state
+    createdBy,
+    // runtime fields (null until used)
+    actualMin:    null,
+    pausedAt:     null,
+    startedAt:    null,
+    doneAt:       null,
+    lateStartMin: null,
+    sessionTopic: null,
+    validSession: null,
+    // legacy compat
+    done:         false,
+    doneAt_legacy: null,
+    delayReason:  "",
+  };
+}
+
+// validWorkedMin: minutes that count as real work for a plan item.
+// RULE: done+validSession=true → actualMin (not durationMin fallback)
+//       paused → pausedAt (partial work, counts but less)
+//       anything else → 0
+function validWorkedMin(item) {
+  const st = itemStatus(item);
+  if (st === "done") {
+    if (item.validSession === false) return 0;   // invalid session -- no credit
+    return item.actualMin != null ? item.actualMin : item.durationMin || 0;
+  }
+  if (st === "paused") return item.pausedAt || 0; // partial credit
+  return 0;
+}
+
+// Same as validWorkedMin but for display purposes includes invalid sessions
+// (so students can see what they did even if it didn't count)
+function actualWorkedMin(item) {
+  const st = itemStatus(item);
+  if (st === "done")   return item.actualMin != null ? item.actualMin : item.durationMin || 0;
+  if (st === "paused") return item.pausedAt || 0;
+  return 0;
+}
+// Update item status -- keeps done in sync for backward compat
+function applyStatus(item, status, extra = {}) {
+  const legacyDone = status === "done";
+  return {
+    ...item,
+    status,
+    done:   legacyDone,
+    doneAt: legacyDone ? new Date().toISOString() : item.doneAt,
+    ...extra,
+  };
+}
+
+// Weekly goals helpers
+// Goal shape: { id, weekStart, subject, targetMin, createdBy, counselorUid }
+function loadWeeklyGoals() {
+  return store.load(KEYS.weeklyGoals, []);
+}
+
+function saveWeeklyGoals(goals) {
+  store.save(KEYS.weeklyGoals, goals);
+}
+
+function getGoalsForWeek(weekStart) {
+  return loadWeeklyGoals().filter((g) => g.weekStart === weekStart);
+}
+
+// Compute actual minutes worked per subject this week from plans
+function subjectMinutesThisWeek(plans, weekStart) {
+  const days = weekDays(weekStart);
+  const map  = {};
+  days.forEach((d) => {
+    (plans[d] || []).forEach((item) => {
+      const worked = validWorkedMin(item);
+      if (worked > 0) map[item.subject] = (map[item.subject] || 0) + worked;
+    });
+  });
+  return map;
 }
 
 // ============================================================================
@@ -450,27 +573,25 @@ function buildTrialTodos(trialData) {
   return todos;
 }
 
-// Plan adherence -- dakika bazli (task count degil)
-// adherenceRate = completedMinutes / targetMinutes
+// Plan adherence -- valid sessions only
+// paused work gets partial credit via validWorkedMin
 function getPlanAdherence(plans, dateStr) {
   const dayPlan = plans[dateStr] || [];
   if (!dayPlan.length) return { rate: 0, completedMin: 0, targetMin: 0, hasData: false };
   const targetMin    = dayPlan.reduce((s, x) => s + (x.durationMin || 0), 0);
-  const completedMin = dayPlan
-    .filter((x) => x.done)
-    .reduce((s, x) => s + (x.actualMin || x.durationMin || 0), 0);
+  const completedMin = dayPlan.reduce((s, x) => s + validWorkedMin(x), 0);
   const rate = targetMin > 0 ? Math.round((completedMin / targetMin) * 100) : 0;
   return { rate, completedMin, targetMin, hasData: true };
 }
 
-// Per-subject adherence
+// Per-subject adherence using itemStatus + validWorkedMin
 function getSubjectAdherence(plans, dateStr) {
   const dayPlan = plans[dateStr] || [];
   const map = {};
   dayPlan.forEach((x) => {
     if (!map[x.subject]) map[x.subject] = { targetMin: 0, completedMin: 0 };
     map[x.subject].targetMin    += x.durationMin || 0;
-    if (x.done) map[x.subject].completedMin += x.actualMin || x.durationMin || 0;
+    map[x.subject].completedMin += validWorkedMin(x);
   });
   return Object.entries(map).map(([subject, d]) => ({
     subject,
@@ -762,20 +883,20 @@ function WeeklyReviewCard({ plans, trials, todos, checkins }) {
   const dayData = last7.map(({ date, label }) => {
     const dayPlan   = plans[date] || [];
     const targetMin = dayPlan.reduce((s, x) => s + (x.durationMin || 0), 0);
-    const doneMin   = dayPlan.filter((x) => x.done).reduce((s, x) => s + (x.actualMin || x.durationMin || 0), 0);
-    // FIX 8: minute-based, -1 means no plan
+    const doneMin   = dayPlan.reduce((s, x) => s + validWorkedMin(x), 0);
     const pct = targetMin > 0 ? Math.round((doneMin / targetMin) * 100) : -1;
     return { date, label, pct, isToday: date === todayStr() };
   });
 
   const totalStudyMin = last7.reduce((s, { date }) =>
-    s + (plans[date] || []).filter((x) => x.done).reduce((a, x) => a + (x.actualMin || x.durationMin), 0), 0);
+    s + (plans[date] || []).reduce((a, x) => a + validWorkedMin(x), 0)
+  , 0);
   const avgCi = (() => {
     const relevant = checkins.filter((c) => last7.some((d) => d.date === c.date));
     return relevant.length ? relevant.reduce((s, c) => s + c.score, 0) / relevant.length : 0;
   })();
   const totalBlocks = last7.reduce((s, { date }) =>
-    s + (plans[date] || []).filter((x) => x.done && x.kind !== "trial").length, 0);
+    s + (plans[date] || []).filter((x) => itemStatus(x) === "done" && x.kind !== "trial").length, 0);
   const trialCount = trials.filter((t) => last7.some((d) => d.date === t.date)).length;
 
   const filled = dayData.filter((d) => d.pct >= 0);
@@ -850,13 +971,13 @@ function Heatmap({ plans, trials, checkins }) {
     const pMap = {};
     const cMap = {};
     const tMap = {};
-    // FIX 7: minute-based adherence score (0-3) instead of task count
+    // Fix 12: validWorkedMin -- invalid sessions don't count, itemStatus is primary
     Object.entries(plans || {}).forEach(([date, items]) => {
       const targetMin    = items.reduce((s, x) => s + (x.durationMin || 0), 0);
-      const completedMin = items.filter((x) => x.done).reduce((s, x) => s + (x.actualMin || x.durationMin || 0), 0);
+      const completedMin = items.reduce((s, x) => s + validWorkedMin(x), 0);
       if (targetMin > 0) {
-        const rate = completedMin / targetMin; // 0-1
-        pMap[date] = Math.round(rate * 3);    // 0-3
+        const rate = completedMin / targetMin;
+        pMap[date] = Math.round(rate * 3);
       }
     });
     // legacy dw sessions fallback
@@ -947,7 +1068,8 @@ function Header({ onToggleHeat, heatOpen, alerts, xp }) {
 }
 
 const TABS = [
-  { key: "plan",       icon: "▦",  label: "Plan" },
+  { key: "plan",       icon: "▦",  label: "Bugun" },
+  { key: "week",       icon: "◫",  label: "Hafta" },
   { key: "brain",      icon: "◈",  label: "Dump" },
   { key: "trials",     icon: "◉",  label: "Denemeler" },
   { key: "todos",      icon: "◻",  label: "Gorevler" },
@@ -1045,24 +1167,26 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
     playSound("start");
     itvRef.current = setInterval(() => setElapsed((p) => p + 1), 1000);
 
-    // Record actual start time and late start delay
+    // Record actual start time, late start delay, and status: running
     setPlans((p) => {
       const todayItems = p[todayStr()] || [];
       const item = todayItems.find((x) => x.id === id);
       if (!item) return p;
       const actualStartMin = nowHHMM();
       const lateMin = Math.max(0, actualStartMin - item.startMin);
-      if (lateMin > 0) {
-        const updated = todayItems.map((x) =>
-          x.id === id
-            ? { ...x, actualStartMin, lateStartMin: lateMin }
-            : x
-        );
-        const next = { ...p, [todayStr()]: updated };
-        store.save(KEYS.plan, next);
-        return next;
-      }
-      return p;
+      const updated = todayItems.map((x) =>
+        x.id === id
+          ? applyStatus(x, "running", {
+              startedAt:    x.startedAt || new Date().toISOString(),
+              actualStartMin,
+              lateStartMin: lateMin > 0 ? lateMin : x.lateStartMin || null,
+              pausedAt:     null,  // clear pause when resuming
+            })
+          : x
+      );
+      const next = { ...p, [todayStr()]: updated };
+      store.save(KEYS.plan, next);
+      return next;
     });
   }, []);
 
@@ -1116,15 +1240,58 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
     const item = (plans[today] || []).find((x) => x.id === id);
     if (!item) return;
 
+    console.log("[finishBlock] triggered for:", id, "actualMin:", actualMin, "early:", early);
+
     // Session validity check
     const valid = isValidSession(actualMin);
 
-    setPlans((p) => ({
-      ...p,
-      [today]: (p[today] || []).map((x) =>
-        x.id === id ? { ...x, done: true, doneAt: new Date().toISOString(), actualMin, validSession: valid } : x
-      ),
-    }));
+    // ROOT CAUSE FIX: compute remaining INSIDE the functional setPlans update
+    // so we always read the latest state, not a stale closure snapshot.
+    // plan_done is derived here and passed out via ref so it can fire after state settles.
+    let shouldGrantPlanDone = false;
+
+    setPlans((p) => {
+      const todayItems = p[today] || [];
+      const updated = todayItems.map((x) => {
+        if (x.id !== id) return x;
+        return applyStatus(x, "done", {
+          actualMin,
+          validSession: valid,
+          doneAt:       new Date().toISOString(),
+          startedAt:    x.startedAt || null,
+        });
+      });
+
+      // All-done check on FRESH state (inside functional update)
+      const stillPending  = updated.filter((x) => itemStatus(x) !== "done").length;
+      const hasEarlyBreak = updated.some((x) =>
+        itemStatus(x) === "done" && x.actualMin != null && x.actualMin < x.durationMin
+      );
+      const isCurrentEarly = early;
+
+      console.log(
+        "[finishBlock] items after update:",
+        updated.map((x) => ({ id: x.id, done: x.done, subject: x.subject })),
+        "stillPending:", stillPending,
+        "hasEarlyBreak:", hasEarlyBreak,
+        "isCurrentEarly:", isCurrentEarly,
+      );
+
+      if (
+        valid &&
+        stillPending === 0 &&
+        !isCurrentEarly &&
+        !hasEarlyBreak &&
+        updated.length > 0
+      ) {
+        shouldGrantPlanDone = true;
+        console.log("[finishBlock] plan_done WILL fire");
+      } else {
+        console.log("[finishBlock] plan_done will NOT fire");
+      }
+
+      return { ...p, [today]: updated };
+    });
 
     // Backward compat: write to dw sessions
     const dwPrev   = store.load(KEYS.dw, { sessions: [], goalMin: 180 });
@@ -1173,23 +1340,18 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
         setTimeout(() => toast(`🔥 ${newXP.streak} gun serisi! +${bonusPts} XP`, "var(--ora)"), 800);
       }
 
-      // All plan done?
-      // Plan tamam kontrolu -- sadece tam tamamlanan (erken mola olmayan) bloklar sayilir
-      const remaining = (plans[today] || []).filter((x) => !x.done && x.id !== id).length;
-      const earlyBreaks = (plans[today] || []).filter((x) => x.done && x.actualMin != null && x.actualMin < x.durationMin && x.id !== id).length;
-      const currentIsEarly = early;
-      if (remaining === 0 && !currentIsEarly && earlyBreaks === 0 && (plans[today] || []).length > 0) {
+      // plan_done -- computed inside setPlans above on fresh state
+      if (shouldGrantPlanDone) {
+        console.log("[plan_done] granting XP and showing toast");
         grantXP("plan_done");
         setTimeout(() => toast(`+${XP_R.plan_done} XP -- Gunluk plan TAMAM!`, "var(--grn)"), 1200);
       }
     } else {
-      // FIX 5: invalid session -- NO win animation, only muted warning
       if (actualMin < SESSION_MIN_MINUTES) {
         toast(`${actualMin}dk -- En az ${SESSION_MIN_MINUTES}dk gerekli, XP kazanilmadi`, "var(--muted)");
       } else {
         toast(`${actualMin}dk -- ${SESSION_MAX_MINUTES}dk limiti asildi, XP kazanilmadi`, "var(--muted)");
       }
-      // No winBlockId, no xpBurst for invalid sessions
     }
 
     // Deneme ise analiz formunu ac
@@ -1232,7 +1394,7 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
       ...prev,
       [today]: (prev[today] || []).map((x) =>
         x.id === activeId
-          ? { ...x, pausedAt: elMin, pauseReason: breakReason }
+          ? applyStatus(x, "paused", { pausedAt: elMin, pauseReason: breakReason })
           : x
       ),
     }));
@@ -1269,32 +1431,28 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
     const usedMin = elapsed > 0 ? Math.floor(elapsed / 60) : item.durationMin;
     finishBlock(id, usedMin, false, null);
   };
-
   const delItem = (id) => {
-    // Aktif (timer çalışıyor veya paused) blok silinemez
+    console.log("[delItem] delete clicked for id:", id, "activeId:", activeId);
     if (activeId === id) {
       toast("Aktif blok silinemez.", "var(--red)");
       return;
     }
-    // Tamamlanmış blok silinemez -- veri bütünlüğü
     const item = (plans[today] || []).find((x) => x.id === id);
-    if (item?.done) {
+    const st   = item ? itemStatus(item) : null;
+    if (st === "done") {
       toast("Tamamlanmış blok silinemez.", "var(--red)");
       return;
     }
-    // Sadece localStorage'a yaz -- store.save yerine doğrudan
-    // Böylece _writeSummary tetiklenmez, plan_done kontrolü çalışmaz
-    setPlansRaw((p) => {
-      const next = { ...p, [today]: (p[today] || []).filter((x) => x.id !== id) };
-      try { localStorage.setItem(KEYS.plan, JSON.stringify(next)); } catch { /* ignore */ }
-      if (_syncUid) fsSave(_syncUid, KEYS.plan, next);
-      return next;
-    });
+    if (st === "paused") {
+      toast("Mola verilmiş blok silinemez.", "var(--red)");
+      return;
+    }
+    console.log("[delItem] deleting item, finishBlock will NOT run");
+    setPlans((p) => ({ ...p, [today]: (p[today] || []).filter((x) => x.id !== id) }));
   };
 
   const totalPlanned  = todayPlan.reduce((s, x) => s + (x.durationMin || 0), 0);
-  const totalActual   = todayPlan.filter((x) => x.done).reduce((s, x) => s + (x.actualMin || x.durationMin), 0);
-  // FIX 3: minute-based completionPct
+  const totalActual   = todayPlan.reduce((s, x) => s + validWorkedMin(x), 0);
   const completionPct = totalPlanned > 0
     ? Math.round((totalActual / totalPlanned) * 100)
     : 0;
@@ -1302,16 +1460,16 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
   const addItem = () => {
     if (!form.subject.trim() && form.kind !== "trial") return;
     const subject = form.kind === "trial" ? `${form.trialType} Deneme` : form.subject.trim();
-    const item = {
-      id: uid(),
-      startMin: hhmmToMins(form.startMin),
-      durationMin: parseInt(form.dur, 10) || 75,
+    const item = makePlanItem({
       subject,
-      note: form.note,
-      kind: form.kind,
-      trialType: form.kind === "trial" ? form.trialType : undefined,
-      done: false, doneAt: null, delayReason: "", actualMin: null,
-    };
+      startMin:    hhmmToMins(form.startMin),
+      durationMin: parseInt(form.dur, 10) || 75,
+      kind:        form.kind,
+      trialType:   form.trialType,
+      note:        form.note,
+      date:        today,
+      createdBy:   "student",
+    });
     setPlans((p) => ({
       ...p,
       [today]: [...(p[today] || []), item].sort((a, b) => a.startMin - b.startMin),
@@ -1321,7 +1479,9 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
     toast(`Plan ogesi eklendi: ${subject}`, "var(--acc)");
   };
 
-  const overdueItems = todayPlan.filter((p) => !p.done && p.startMin + p.durationMin < nowMin);
+  const overdueItems = todayPlan.filter((p) =>
+    itemStatus(p) === "planned" && p.id !== activeId && p.startMin + p.durationMin < nowMin
+  );
   const attnScore = calcAttentionScore(attn[today]?.breaks || []);
   const { label: aLabel, color: aColor } = attentionLabel(attnScore);
   const activeItem = todayPlan.find((x) => x.id === activeId);
@@ -1504,7 +1664,7 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
             </div>
           </div>
           <PBar value={completionPct} max={100} color={completionPct === 100 ? "var(--grn)" : "var(--acc)"} />
-          {completionPct === 100 && (
+          {completionPct === 100 && todayPlan.length > 0 && todayPlan.every((x) => itemStatus(x) === "done") && (
             <div className="blockWin" style={{ marginTop: "8px", textAlign: "center", padding: "6px", background: "var(--grn)08", borderRadius: "6px" }}>
               <span style={{ fontFamily: "var(--mono)", fontSize: "11px", color: "var(--grn)", fontWeight: "700" }}>PLAN TAMAM -- harika is!</span>
             </div>
@@ -1617,12 +1777,35 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
         <DelayModal
           delayedMin={delayModal.delayedMin}
           onConfirm={(r) => {
-            setPlans((p) => ({ ...p, [today]: (p[today] || []).map((x) => x.id === delayModal.id ? { ...x, done: true, doneAt: new Date().toISOString(), delayReason: r, actualMin: x.durationMin } : x) }));
-            const item = todayPlan.find((x) => x.id === delayModal.id);
+            const targetId = delayModal.id;
+            let shouldPlanDone = false;
+            setPlans((p) => {
+              const updated = (p[today] || []).map((x) =>
+                x.id === targetId
+                  ? applyStatus(x, "done", {
+                      delayReason:  r,
+                      actualMin:    x.durationMin,
+                      validSession: isValidSession(x.durationMin), // real check, not forced true
+                    })
+                  : x
+              );
+              // Check plan_done on fresh state
+              const stillPending  = updated.filter((x) => itemStatus(x) !== "done").length;
+              const hasEarlyBreak = updated.some((x) => itemStatus(x) === "done" && x.actualMin != null && x.actualMin < x.durationMin);
+              if (stillPending === 0 && !hasEarlyBreak && updated.length > 0) {
+                shouldPlanDone = true;
+              }
+              return { ...p, [today]: updated };
+            });
+            const item = todayPlan.find((x) => x.id === targetId);
             if (item?.kind === "trial") setPendingTrialItem(item);
             setDelayModal(null);
             playSound("done");
             toast("Plan ogesi tamamlandi", "var(--grn)");
+            if (shouldPlanDone) {
+              grantXP("plan_done");
+              setTimeout(() => toast(`+${XP_R.plan_done} XP -- Gunluk plan TAMAM!`, "var(--grn)"), 1200);
+            }
           }}
           onCancel={() => setDelayModal(null)}
         />
@@ -1631,35 +1814,40 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
   );
 }
 
-function PlanItemRow({ item, nowMin, activeId, elapsed, timerPhase, winBlockId, onStart, onStop, onDone, onDelete }) {
-  const isActive = activeId === item.id;
-  const isWin    = winBlockId === item.id;
+function PlanItemRow({ item, nowMin, activeId, elapsed, timerPhase, winBlockId, onStart, onStop, onDone, onDelete, isReadOnly }) {
+  const isActive  = activeId === item.id;
+  const isWin     = winBlockId === item.id;
+  const st        = itemStatus(item); // V2: status is primary
 
-  // Paused: timer durdurulmuş, henüz done değil
-  const isPaused     = !item.done && item.pausedAt != null && activeId !== item.id;
-  // EarlyBreak: done AND actualMin < durationMin (Bitir ile erken bitirilmiş)
-  const isEarlyBreak = item.done && item.actualMin != null && item.actualMin < item.durationMin;
-  const isFullDone   = item.done && !isEarlyBreak;
+  // Derive display states from canonical status
+  const isPaused     = st === "paused"  && !isActive;
+  const isEarlyBreak = st === "done"    && item.actualMin != null && item.actualMin < item.durationMin;
+  const isFullDone   = st === "done"    && !isEarlyBreak;
+  const isSkipped    = st === "skipped";
 
-  const status = item.done
+  const displayDone = st === "done"; // for legacy "done" styling
+
+  const status = displayDone
     ? (isEarlyBreak ? "early" : "done")
     : isActive   ? "active"
     : isPaused   ? "paused"
+    : isSkipped  ? "skipped"
     : nowMin > item.startMin + item.durationMin ? "late"
     : "upcoming";
 
-  const colMap   = { done: "var(--grn)", early: "var(--ora)", active: "var(--acc)", late: "var(--red)", paused: "var(--ora)", upcoming: "var(--muted)" };
+  const colMap   = { done:"var(--grn)", early:"var(--ora)", active:"var(--acc)", late:"var(--red)", paused:"var(--ora)", upcoming:"var(--muted)", skipped:"var(--muted)" };
   const col      = colMap[status];
-  const pct      = isActive ? clamp(Math.round((elapsed / (item.durationMin * 60)) * 100), 0, 100)
+  const pct      = isActive   ? clamp(Math.round((elapsed / (item.durationMin * 60)) * 100), 0, 100)
                  : isFullDone ? 100
                  : isEarlyBreak ? Math.round((item.actualMin / item.durationMin) * 100)
-                 : isPaused ? Math.round(((item.pausedAt || 0) / item.durationMin) * 100)
+                 : isPaused   ? Math.round(((item.pausedAt || 0) / item.durationMin) * 100)
                  : 0;
-  const borderCss = status === "late"   ? "var(--red)33"
-                  : status === "active" ? "var(--acc)33"
-                  : status === "done"   ? "var(--grn)22"
-                  : status === "early"  ? "var(--ora)33"
-                  : status === "paused" ? "var(--ora)22"
+  const borderCss = status === "late"    ? "var(--red)33"
+                  : status === "active"  ? "var(--acc)33"
+                  : status === "done"    ? "var(--grn)22"
+                  : status === "early"   ? "var(--ora)33"
+                  : status === "paused"  ? "var(--ora)22"
+                  : status === "skipped" ? "var(--muted)22"
                   : item.kind === "trial" ? "var(--blu)33"
                   : "var(--b2)";
 
@@ -1672,19 +1860,19 @@ function PlanItemRow({ item, nowMin, activeId, elapsed, timerPhase, winBlockId, 
           <div>
             <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
               {item.kind === "trial" && <Tag color="var(--blu)">{item.trialType || "TYT"}</Tag>}
-              <p style={{ fontSize: "13px", fontWeight: "500", textDecoration: item.done ? "line-through" : "none", color: item.done ? "var(--muted)" : "var(--txt)" }}>{item.subject}</p>
+              <p style={{ fontSize: "13px", fontWeight: "500", textDecoration: displayDone ? "line-through" : "none", color: displayDone ? "var(--muted)" : "var(--txt)" }}>{item.subject}</p>
             </div>
             <div style={{ display: "flex", gap: "6px", marginTop: "3px", alignItems: "center", flexWrap: "wrap" }}>
               <span style={{ fontSize: "10px", color: "var(--muted)" }}>{fmtHHMM(item.durationMin)} hedef</span>
               {item.note && <span style={{ fontSize: "10px", color: "var(--muted)" }}>· {item.note}</span>}
-              {status === "late" && !item.done && <Tag color="var(--red)">Gecikmis</Tag>}
+              {status === "late" && <Tag color="var(--red)">Gecikmis</Tag>}
               {item.delayReason && <span style={{ fontSize: "10px", color: "var(--ora)" }}>· {item.delayReason}</span>}
               {item.lateStartMin > 0 && (
                 <span style={{ fontSize: "9px", color: "var(--red)", fontFamily: "var(--mono)" }}>
                   {item.lateStartMin}dk gec basladi
                 </span>
               )}
-              {item.done && item.actualMin != null && (
+              {displayDone && item.actualMin != null && (
                 item.actualMin < item.durationMin
                   ? <span style={{ fontSize: "9px", color: "var(--ora)" }}>
                       {fmtHHMM(item.actualMin)} calistin · {fmtHHMM(item.durationMin - item.actualMin)} eksik
@@ -1693,22 +1881,25 @@ function PlanItemRow({ item, nowMin, activeId, elapsed, timerPhase, winBlockId, 
                       {fmtHHMM(item.actualMin)} tamamlandi
                     </span>
               )}
-              {item.done && item.validSession === false && item.actualMin != null && item.actualMin < SESSION_MIN_MINUTES && (
+              {displayDone && item.validSession === false && item.actualMin != null && item.actualMin < SESSION_MIN_MINUTES && (
                 <Tag color="var(--muted)">gecersiz ({item.actualMin}dk)</Tag>
               )}
             </div>
           </div>
         </div>
         <div style={{ display: "flex", gap: "4px", flexShrink: 0 }}>
-          {!item.done && !isActive && <Btn size="sm" variant="accent" onClick={onStart}>▶</Btn>}
+          {!displayDone && !isPaused && !isActive && !isReadOnly && <Btn size="sm" variant="accent" onClick={onStart}>▶</Btn>}
           {isActive && timerPhase === "run" && elapsed > 30 && <Btn size="sm" variant="success" onClick={onDone}>Bitir</Btn>}
           {isActive && timerPhase === "run" && <Btn size="sm" variant="ghost" onClick={onStop} style={{ color: "var(--muted)" }}>◼</Btn>}
-          {/* Tamamlanmış veya aktif blok silinemez */}
-          {!item.done && (
+          {/* Tamamlanmış, aktif, paused veya readonly blok silinemez */}
+          {!displayDone && !isPaused && !isReadOnly && (
             <Btn size="sm" variant="ghost" onClick={onDelete}
               disabled={isActive}
               style={{ color: isActive ? "var(--b2)" : "var(--red)", cursor: isActive ? "not-allowed" : "pointer" }}
               title={isActive ? "Aktif blok silinemez" : "Sil"}>×</Btn>
+          )}
+          {isReadOnly && (
+            <span style={{ fontFamily: "var(--mono)", fontSize: "8px", color: "var(--muted)", padding: "2px 5px", border: "1px solid var(--b2)", borderRadius: "3px" }}>oku</span>
           )}
         </div>
       </div>
@@ -2443,10 +2634,10 @@ const overallMsg = (s) => {
 function calcBenchmark({ xp, plans, checkins }) {
   const last7 = Array.from({ length: 7 }, (_, i) => new Date(Date.now() - i * 86400000).toISOString().slice(0, 10));
   const planItems = last7.flatMap((d) => plans?.[d] || []);
-  const planDone  = planItems.filter((p) => p.done).length;
+  const planDone  = planItems.filter((p) => itemStatus(p) === "done").length;
   const planRatio = planItems.length > 0 ? planDone / planItems.length : 0;
   const planMin   = last7.reduce((s, d) =>
-    s + (plans?.[d] || []).filter((x) => x.done).reduce((a, x) => a + (x.actualMin || x.durationMin), 0), 0);
+    s + (plans?.[d] || []).reduce((a, x) => a + validWorkedMin(x), 0), 0);
   const ci    = (checkins || []).filter((c) => last7.includes(c.date));
   const ciAvg = ci.length ? ci.reduce((s, c) => s + (c.score || 0), 0) / ci.length : 0;
   const xpScore = clamp((xp.points || 0) / 5000, 0, 1);
@@ -2465,7 +2656,7 @@ function generateDailyChallenge({ date, trials, todos, plans }) {
   const topWeak  = weekPlan[0]?.subject;
   const overdueTodos = todos.filter((t) => !t.done && !t.reviewed && t.reviewAt && daysFrom(t.reviewAt) >= 0).length;
   const todayPlan    = plans[date] || [];
-  const planLate     = todayPlan.filter((p) => !p.done && p.startMin + p.durationMin < nowHHMM()).length;
+  const planLate     = todayPlan.filter((p) => itemStatus(p) === "planned" && p.startMin + p.durationMin < nowHHMM()).length;
   const pool = [
     { id: `c_${date}_review`, title: "15dk Gorev Review", desc: "7 gun uyarili gorevleri bitir veya ertele." },
     { id: `c_${date}_plan`,   title: "1 plan ogesi tamamla", desc: "En kucuk plan ogesini sec ve bitir." },
@@ -2491,12 +2682,13 @@ function DisciplineTab({ trials, todos }) {
   const todayAttn = attn[today];
   const attnScore = useMemo(() => calcAttentionScore(todayAttn?.breaks || []), [todayAttn]);
   const todayPlan = plans[today] || [];
-  const planPct   = todayPlan.length > 0
-    ? Math.round((todayPlan.filter((p) => p.done).length / todayPlan.length) * 100)
-    : 0;
+  // Fix 11: minute-based planPct using itemStatus + validWorkedMin
+  const planTarget = todayPlan.reduce((s, x) => s + (x.durationMin || 0), 0);
+  const planWorked = todayPlan.reduce((s, x) => s + validWorkedMin(x), 0);
+  const planPct    = planTarget > 0 ? Math.round((planWorked / planTarget) * 100) : 0;
 
   const todoOverdue   = todos.filter((t) => !t.done && !t.reviewed && t.reviewAt && daysFrom(t.reviewAt) >= 0).length;
-  const planLate      = todayPlan.filter((p) => !p.done && p.startMin + p.durationMin < nowHHMM()).length;
+  const planLate      = todayPlan.filter((p) => itemStatus(p) === "planned" && p.startMin + p.durationMin < nowHHMM()).length;
   const missingCheckin = checkins.find((c) => c.date === today) ? 0 : 1;
 
   const submit = () => {
@@ -2891,15 +3083,17 @@ export default function App() {
     setTodos((prev) => { const next = [...mapped, ...prev]; store.save(KEYS.todos, next); return next; });
   }, []);
 
-  // FIX 12: include trials and todos in deps so memos re-read when data changes
-  // tab change also triggers re-read (existing behavior preserved)
-  const checkins = useMemo(() => store.load(KEYS.checkins, []), [tab, trials, todos]);
-  const plans    = useMemo(() => store.load(KEYS.plan, {}),    [tab, trials, todos]);
+  // checkins ve plans App() seviyesinde tab'a göre store'dan okunur.
+  // PlanTab kendi setPlans/setAttn wrapper'larıyla store'a yazıp
+  // kendi local state'ini günceller -- App()'teki bu memo sadece
+  // diğer tab'lar ve header için kullanılır.
+  const checkins = useMemo(() => store.load(KEYS.checkins, []), [tab]);
+  const plans    = useMemo(() => store.load(KEYS.plan, {}),    [tab]);
 
   const alerts = useMemo(() => {
     const today       = todayStr();
     const todayPlan   = plans[today] || [];
-    const planLate    = todayPlan.filter((p) => !p.done && p.startMin + p.durationMin < nowHHMM()).length;
+    const planLate    = todayPlan.filter((p) => itemStatus(p) === "planned" && p.startMin + p.durationMin < nowHHMM()).length;
     const todoOverdue = todos.filter((t) => !t.done && !t.reviewed && t.reviewAt && daysFrom(t.reviewAt) >= 0).length;
     const missingCheckin = checkins.find((c) => c.date === today) ? 0 : 1;
     return { plan: planLate, brain: 0, trials: 0, todos: todoOverdue, discipline: missingCheckin };
@@ -3013,6 +3207,7 @@ export default function App() {
         <TabBar active={tab} onChange={setTab} alerts={alerts} />
         <div className="fu" key={tab}>
           {tab === "plan"       && <PlanTab trials={trials} setTrials={setTrials} todos={todos} onPushTodos={pushTodos} />}
+          {tab === "week"       && <WeekTab trials={trials} onPushTodos={pushTodos} />}
           {tab === "brain"      && <BrainDumpTab todos={todos} onPushTodos={pushTodos} />}
           {tab === "trials"     && <TrialsTab trials={trials} setTrials={setTrials} onPushTodos={pushTodos} />}
           {tab === "todos"      && <TodosTab todos={todos} setTodos={setTodos} />}
@@ -3020,6 +3215,426 @@ export default function App() {
         </div>
       </div>
       <ToastLayer toasts={toasts} />
+    </div>
+  );
+}
+
+// ============================================================================
+// WEEK TAB -- Plan V2: weekly view with date navigation, goals, readonly guards
+// ============================================================================
+
+// Subjects for quick-add
+const SUBJECTS = ["Matematik", "Fizik", "Kimya", "Biyoloji", "Turkce", "Edebiyat", "Tarih", "Cografya", "Felsefe", "Diger"];
+
+function WeeklyGoalsPanel({ weekStart, plans, onClose }) {
+  const [goals, setGoals]     = useState(() => getGoalsForWeek(weekStart));
+  const [subject, setSubject] = useState("");
+  const [hours, setHours]     = useState("3");
+
+  const worked = subjectMinutesThisWeek(plans, weekStart);
+
+  const addGoal = () => {
+    if (!subject.trim() || !hours) return;
+    const newGoal = {
+      id:          uid(),
+      weekStart,
+      subject:     subject.trim(),
+      targetMin:   Math.round(parseFloat(hours) * 60),
+      createdBy:   "student",
+      counselorUid: null,
+    };
+    const updated = [...goals, newGoal];
+    setGoals(updated);
+    saveWeeklyGoals([...loadWeeklyGoals().filter((g) => g.weekStart !== weekStart || g.id !== newGoal.id), newGoal]);
+    setSubject("");
+  };
+
+  const removeGoal = (id) => {
+    const goal = goals.find((g) => g.id === id);
+    if (goal?.locked || goal?.createdBy === "counselor") return; // counselor goals cannot be deleted by student
+    const updated = goals.filter((g) => g.id !== id);
+    setGoals(updated);
+    saveWeeklyGoals(loadWeeklyGoals().filter((g) => g.id !== id));
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.8)", display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 300, backdropFilter: "blur(4px)" }} onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()} style={{ background: "var(--s1)", border: "1px solid var(--b1)", borderRadius: "14px 14px 0 0", padding: "20px", width: "100%", maxWidth: "540px", maxHeight: "70vh", overflowY: "auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
+          <Label>Haftalik Ders Hedefleri</Label>
+          <button onClick={onClose} style={{ background: "none", color: "var(--muted)", fontSize: "18px", cursor: "pointer" }}>×</button>
+        </div>
+
+        {/* Add goal */}
+        <div style={{ display: "flex", gap: "6px", marginBottom: "14px" }}>
+          <select value={subject} onChange={(e) => setSubject(e.target.value)}
+            style={{ flex: 2, padding: "7px 9px", fontSize: "12px", borderRadius: "6px" }}>
+            <option value="">Ders sec...</option>
+            {SUBJECTS.map((s) => <option key={s} value={s}>{s}</option>)}
+          </select>
+          <input value={hours} onChange={(e) => setHours(e.target.value)} type="number" min="0.5" max="20" step="0.5"
+            placeholder="Saat" style={{ width: "60px", padding: "7px 8px", fontSize: "12px", textAlign: "center" }} />
+          <Btn variant="primary" onClick={addGoal} disabled={!subject}>Ekle</Btn>
+        </div>
+
+        {/* Goals list with progress */}
+        {goals.length === 0 && (
+          <p style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--muted)", textAlign: "center", padding: "16px" }}>
+            Henuz haftalik hedef yok.
+          </p>
+        )}
+        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+          {goals.map((g) => {
+            const workedMin = worked[g.subject] || 0;
+            const pct       = g.targetMin > 0 ? Math.min(Math.round((workedMin / g.targetMin) * 100), 100) : 0;
+            const color     = pct >= 100 ? "var(--grn)" : pct >= 60 ? "var(--acc)" : "var(--red)";
+            return (
+              <div key={g.id} style={{ padding: "10px 12px", background: "var(--s2)", borderRadius: "8px", border: "1px solid var(--b2)" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                    <p style={{ fontSize: "13px", fontWeight: "500" }}>{g.subject}</p>
+                    {g.createdBy === "counselor" && (
+                      <span style={{ fontFamily: "var(--mono)", fontSize: "8px", color: "var(--pur)", background: "var(--pur)18", padding: "1px 5px", borderRadius: "3px" }}>rehber</span>
+                    )}
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    <span style={{ fontFamily: "var(--mono)", fontSize: "10px", color }}>
+                      {fmtHHMM(workedMin)} / {fmtHHMM(g.targetMin)}
+                    </span>
+                    {g.createdBy !== "counselor" && (
+                      <button onClick={() => removeGoal(g.id)} style={{ background: "none", color: "var(--muted)", cursor: "pointer", fontSize: "13px" }}>×</button>
+                    )}
+                  </div>
+                </div>
+                <PBar value={workedMin} max={g.targetMin} color={color} h={4} />
+                <p style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)", marginTop: "4px" }}>%{pct} · {pct >= 100 ? "Hedef tamamlandi!" : `${fmtHHMM(g.targetMin - workedMin)} kaldi`}</p>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function WeekTab({ trials, onPushTodos }) {
+  const today     = todayStr();
+  const [plans, setPlansRaw] = useState(() => store.load(KEYS.plan, {}));
+  const setPlans = useCallback((fn) => {
+    setPlansRaw((p) => { const n = typeof fn === "function" ? fn(p) : fn; store.save(KEYS.plan, n); return n; });
+  }, []);
+
+  // Week navigation
+  const [viewWeekStart, setViewWeekStart] = useState(() => weekMonday(today));
+  const days = weekDays(viewWeekStart);
+  const [selectedDay, setSelectedDay]   = useState(today);
+  const [showGoals,   setShowGoals]     = useState(false);
+  const [addOpen,     setAddOpen]       = useState(false);
+  const [form, setForm] = useState({ subject: "", topic: "", startMin: "09:00", dur: "75", kind: "study", trialType: "TYT" });
+
+  const prevWeek = () => {
+    const d = new Date(viewWeekStart);
+    d.setDate(d.getDate() - 7);
+    const w = d.toISOString().slice(0, 10);
+    setViewWeekStart(w);
+    setSelectedDay(w);
+  };
+  const nextWeek = () => {
+    const d = new Date(viewWeekStart);
+    d.setDate(d.getDate() + 7);
+    const w = d.toISOString().slice(0, 10);
+    setViewWeekStart(w);
+    setSelectedDay(w);
+  };
+  const goToday = () => { setViewWeekStart(weekMonday(today)); setSelectedDay(today); };
+
+  const selectedPlan = plans[selectedDay] || [];
+  const isReadOnly   = isPast(selectedDay);
+  const isFut        = isFuture(selectedDay);
+  const isTod        = isToday(selectedDay);
+
+  // Day summary: worked minutes per day for bar chart
+  const daySummary = days.map((d) => {
+    const items  = plans[d] || [];
+    const target = items.reduce((s, x) => s + (x.durationMin || 0), 0);
+    const worked = items.reduce((s, x) => s + validWorkedMin(x), 0);
+    return { date: d, target, worked, items: items.length };
+  });
+
+  // Weekly totals
+  const totalTarget = daySummary.reduce((s, d) => s + d.target, 0);
+  const totalWorked = daySummary.reduce((s, d) => s + d.worked, 0);
+  const weekPct     = totalTarget > 0 ? Math.round((totalWorked / totalTarget) * 100) : 0;
+
+  // Goals progress
+  const goals  = getGoalsForWeek(viewWeekStart);
+  const worked = subjectMinutesThisWeek(plans, viewWeekStart);
+
+  const addFutureItem = () => {
+    if (!form.subject.trim() && form.kind !== "trial") return;
+    const subject = form.kind === "trial" ? `${form.trialType} Deneme` : form.subject.trim();
+    const item = makePlanItem({
+      subject,
+      topic:       form.topic,
+      startMin:    hhmmToMins(form.startMin),
+      durationMin: parseInt(form.dur, 10) || 75,
+      kind:        form.kind,
+      trialType:   form.trialType,
+      note:        "",
+      date:        selectedDay,
+      createdBy:   "student",
+    });
+    setPlans((p) => ({
+      ...p,
+      [selectedDay]: [...(p[selectedDay] || []), item].sort((a, b) => a.startMin - b.startMin),
+    }));
+    setForm((f) => ({ ...f, subject: "", topic: "" }));
+    setAddOpen(false);
+    toast(`${selectedDay} icin eklendi: ${subject}`, "var(--acc)");
+  };
+
+  const delFutureItem = (id) => {
+    if (isReadOnly) return;
+    const item = selectedPlan.find((x) => x.id === id);
+    const st   = item ? itemStatus(item) : null;
+    if (st === "done" || st === "paused" || st === "running") return;
+    setPlans((p) => ({ ...p, [selectedDay]: (p[selectedDay] || []).filter((x) => x.id !== id) }));
+  };
+
+  const DAY_LABELS = ["Pzt", "Sal", "Car", "Per", "Cum", "Cmt", "Paz"];
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
+
+      {/* Week header */}
+      <Card style={{ padding: "12px 14px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+          <div style={{ display: "flex", gap: "6px" }}>
+            <Btn variant="ghost" onClick={prevWeek} style={{ padding: "4px 10px", fontSize: "12px" }}>←</Btn>
+            <Btn variant="ghost" onClick={nextWeek} style={{ padding: "4px 10px", fontSize: "12px" }}>→</Btn>
+            {viewWeekStart !== weekMonday(today) && (
+              <Btn variant="accent" onClick={goToday} style={{ padding: "4px 10px", fontSize: "10px" }}>Bugun</Btn>
+            )}
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <p style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--muted)" }}>
+              {viewWeekStart} haftasi
+            </p>
+            <p style={{ fontFamily: "var(--mono)", fontSize: "11px", color: weekPct >= 70 ? "var(--grn)" : weekPct >= 40 ? "var(--acc)" : "var(--muted)" }}>
+              {fmtHHMM(totalWorked)} / {fmtHHMM(totalTarget)} · %{weekPct}
+            </p>
+          </div>
+        </div>
+
+        {/* 7-day bar chart */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: "4px" }}>
+          {daySummary.map((d, i) => {
+            const barH    = d.target > 0 ? Math.max(4, Math.round((d.worked / d.target) * 44)) : 4;
+            const barC    = d.target === 0 ? "var(--b2)"
+                          : d.worked >= d.target ? "var(--grn)"
+                          : d.worked > 0         ? "var(--acc)"
+                          : "var(--b2)";
+            const isSel   = d.date === selectedDay;
+            const isTodD  = d.date === today;
+            return (
+              <button key={d.date} onClick={() => setSelectedDay(d.date)}
+                style={{ padding: "6px 2px 4px", borderRadius: "7px", border: `1px solid ${isSel ? "var(--acc)" : "transparent"}`, background: isSel ? "var(--acc)15" : "transparent", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: "3px" }}>
+                <div style={{ width: "100%", height: "44px", display: "flex", alignItems: "flex-end", justifyContent: "center" }}>
+                  <div style={{ width: "14px", height: `${barH}px`, background: barC, borderRadius: "3px 3px 0 0", transition: "height .3s ease" }} />
+                </div>
+                <span style={{ fontFamily: "var(--mono)", fontSize: "8px", color: isTodD ? "var(--acc)" : isSel ? "var(--txt)" : "var(--muted)", fontWeight: isTodD ? "700" : "400" }}>
+                  {DAY_LABELS[i]}
+                </span>
+                {d.items > 0 && (
+                  <span style={{ fontFamily: "var(--mono)", fontSize: "7px", color: "var(--muted)" }}>{d.items}</span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      </Card>
+
+      {/* Weekly goals summary (compact) -- counselor goals shown prominently */}
+      {goals.length > 0 && (() => {
+        const counselorGoals = goals.filter((g) => g.createdBy === "counselor");
+        const studentGoals   = goals.filter((g) => g.createdBy !== "counselor");
+        return (
+          <Card style={{ padding: "12px 14px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+              <Label>Haftalik Hedefler</Label>
+              <button onClick={() => setShowGoals(true)} style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--acc)", background: "none", cursor: "pointer" }}>
+                Duzenle
+              </button>
+            </div>
+
+            {/* Counselor goals -- highlighted */}
+            {counselorGoals.length > 0 && (
+              <div style={{ marginBottom: studentGoals.length > 0 ? "10px" : "0" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "5px", marginBottom: "6px" }}>
+                  <span style={{ fontFamily: "var(--mono)", fontSize: "8px", color: "var(--pur)", background: "var(--pur)18", border: "1px solid var(--pur)33", padding: "1px 6px", borderRadius: "3px" }}>REHBERLİK</span>
+                  <span style={{ fontSize: "10px", color: "var(--muted)" }}>Rehberlikci tarafindan belirlendi</span>
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                  {counselorGoals.map((g) => {
+                    const w   = worked[g.subject] || 0;
+                    const pct = g.targetMin > 0 ? Math.min(Math.round((w / g.targetMin) * 100), 100) : 0;
+                    const c   = pct >= 100 ? "var(--grn)" : pct >= 60 ? "var(--acc)" : pct >= 30 ? "var(--ora)" : "var(--red)";
+                    return (
+                      <div key={g.id} style={{ padding: "8px 10px", background: "var(--s2)", borderRadius: "7px", border: "1px solid var(--pur)22" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "5px" }}>
+                          <span style={{ fontSize: "12px", fontWeight: "500" }}>{g.subject}</span>
+                          <span style={{ fontFamily: "var(--mono)", fontSize: "10px", color: c }}>
+                            {fmtHHMM(w)} / {fmtHHMM(g.targetMin)}
+                          </span>
+                        </div>
+                        <PBar value={w} max={g.targetMin} color={c} h={4} />
+                        <p style={{ fontFamily: "var(--mono)", fontSize: "8px", color: "var(--muted)", marginTop: "3px" }}>
+                          {pct >= 100 ? "Hedef tamamlandi!" : `%${pct} · ${fmtHHMM(g.targetMin - w)} kaldi`}
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Student's own goals */}
+            {studentGoals.length > 0 && (
+              <div>
+                {counselorGoals.length > 0 && (
+                  <Label style={{ marginBottom: "6px", marginTop: "2px" }}>Kendi Hedeflerim</Label>
+                )}
+                <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
+                  {studentGoals.slice(0, 3).map((g) => {
+                    const w   = worked[g.subject] || 0;
+                    const pct = g.targetMin > 0 ? Math.min(Math.round((w / g.targetMin) * 100), 100) : 0;
+                    const c   = pct >= 100 ? "var(--grn)" : pct >= 60 ? "var(--acc)" : "var(--muted)";
+                    return (
+                      <div key={g.id}>
+                        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "3px" }}>
+                          <span style={{ fontSize: "11px" }}>{g.subject}</span>
+                          <span style={{ fontFamily: "var(--mono)", fontSize: "9px", color: c }}>{fmtHHMM(w)}/{fmtHHMM(g.targetMin)}</span>
+                        </div>
+                        <PBar value={w} max={g.targetMin} color={c} h={3} />
+                      </div>
+                    );
+                  })}
+                  {studentGoals.length > 3 && (
+                    <p style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)" }}>+{studentGoals.length - 3} hedef daha</p>
+                  )}
+                </div>
+              </div>
+            )}
+          </Card>
+        );
+      })()}
+
+      {/* Selected day plan */}
+      <Card style={{ padding: "12px 14px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+          <div>
+            <Label>{new Date(selectedDay + "T12:00:00").toLocaleDateString("tr-TR", { weekday: "long", day: "numeric", month: "long" })}</Label>
+            <div style={{ display: "flex", gap: "5px", marginTop: "3px" }}>
+              {isTod && <span style={{ fontFamily: "var(--mono)", fontSize: "8px", color: "var(--acc)", background: "var(--acc)18", padding: "1px 6px", borderRadius: "3px" }}>BUGUN</span>}
+              {isReadOnly && <span style={{ fontFamily: "var(--mono)", fontSize: "8px", color: "var(--muted)", background: "var(--b2)", padding: "1px 6px", borderRadius: "3px" }}>GECMIS - SALT OKUMA</span>}
+              {isFut && <span style={{ fontFamily: "var(--mono)", fontSize: "8px", color: "var(--blu)", background: "var(--blu)18", padding: "1px 6px", borderRadius: "3px" }}>GELECEK - PLANLAMA</span>}
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: "5px" }}>
+            {!isReadOnly && (
+              <Btn variant="primary" onClick={() => setAddOpen((p) => !p)} style={{ padding: "5px 10px", fontSize: "11px" }}>
+                {addOpen ? "Kapat" : "+ Ekle"}
+              </Btn>
+            )}
+            <Btn variant="ghost" onClick={() => setShowGoals(true)} style={{ padding: "5px 10px", fontSize: "11px" }}>Hedefler</Btn>
+          </div>
+        </div>
+
+        {/* Add form for future/today planning */}
+        {addOpen && !isReadOnly && (
+          <div className="fi" style={{ padding: "12px", background: "var(--s2)", borderRadius: "8px", marginBottom: "10px", display: "flex", flexDirection: "column", gap: "8px" }}>
+            <div style={{ display: "flex", gap: "6px" }}>
+              <select value={form.kind} onChange={(e) => setForm((f) => ({ ...f, kind: e.target.value }))}
+                style={{ padding: "6px 8px", fontSize: "12px", borderRadius: "6px", flex: "0 0 auto" }}>
+                <option value="study">Ders</option>
+                <option value="trial">Deneme</option>
+              </select>
+              {form.kind === "study" ? (
+                <input value={form.subject} onChange={(e) => setForm((f) => ({ ...f, subject: e.target.value }))}
+                  placeholder="Ders adi" style={{ flex: 1, padding: "6px 9px", fontSize: "12px" }} />
+              ) : (
+                <select value={form.trialType} onChange={(e) => setForm((f) => ({ ...f, trialType: e.target.value }))}
+                  style={{ flex: 1, padding: "6px 8px", fontSize: "12px", borderRadius: "6px" }}>
+                  <option>TYT</option><option>AYT</option>
+                </select>
+              )}
+            </div>
+            {form.kind === "study" && (
+              <input value={form.topic} onChange={(e) => setForm((f) => ({ ...f, topic: e.target.value }))}
+                placeholder="Konu (opsiyonel)" style={{ padding: "6px 9px", fontSize: "12px" }} />
+            )}
+            <div style={{ display: "flex", gap: "6px" }}>
+              <input value={form.startMin} onChange={(e) => setForm((f) => ({ ...f, startMin: e.target.value }))}
+                type="time" style={{ flex: 1, padding: "6px 8px", fontSize: "12px" }} />
+              <input value={form.dur} onChange={(e) => setForm((f) => ({ ...f, dur: e.target.value }))}
+                type="number" min="10" max="180" placeholder="dk" style={{ width: "64px", padding: "6px 8px", fontSize: "12px" }} />
+              <Btn variant="primary" onClick={addFutureItem}>Ekle</Btn>
+            </div>
+          </div>
+        )}
+
+        {/* Plan items for selected day (readonly for past) */}
+        {selectedPlan.length === 0 ? (
+          <EmptyState icon="◫" title={isReadOnly ? "Bu gun plan yok" : "Henuz plan eklenmemis"} desc={isReadOnly ? "Gecmis gun." : "Yukardaki + butonuyla ekleyebilirsin."} />
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+            {selectedPlan.map((item) => {
+              const st = itemStatus(item);
+              const stColor = st === "done" ? "var(--grn)" : st === "paused" ? "var(--ora)" : st === "skipped" ? "var(--muted)" : "var(--muted)";
+              const stIcon  = st === "done" ? "●" : st === "paused" ? "◑" : st === "running" ? "▶" : "○";
+              return (
+                <div key={item.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "9px 11px", background: "var(--s2)", borderRadius: "7px", border: `1px solid ${st === "done" ? "var(--grn)22" : st === "paused" ? "var(--ora)22" : "var(--b2)"}` }}>
+                  <div style={{ display: "flex", gap: "9px", alignItems: "flex-start", flex: 1, minWidth: 0 }}>
+                    <span style={{ fontFamily: "var(--mono)", fontSize: "10px", color: stColor, marginTop: "1px", flexShrink: 0 }}>{stIcon}</span>
+                    <div style={{ minWidth: 0 }}>
+                      <p style={{ fontSize: "12px", fontWeight: "500", textDecoration: st === "done" ? "line-through" : "none", color: st === "done" ? "var(--muted)" : "var(--txt)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {item.subject}
+                        {item.topic && <span style={{ color: "var(--muted)", fontWeight: "400" }}> · {item.topic}</span>}
+                      </p>
+                      <div style={{ display: "flex", gap: "6px", marginTop: "2px", flexWrap: "wrap" }}>
+                        <span style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)" }}>{minsToHHMM(item.startMin)}</span>
+                        <span style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)" }}>{fmtHHMM(item.durationMin)}</span>
+                        {st === "done" && item.actualMin && item.actualMin !== item.durationMin && (
+                          <span style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--ora)" }}>{fmtHHMM(item.actualMin)} gercek</span>
+                        )}
+                        {st === "paused" && (
+                          <span style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--ora)" }}>{item.pausedAt}dk'da duraklatildi</span>
+                        )}
+                        {item.createdBy === "counselor" && (
+                          <span style={{ fontFamily: "var(--mono)", fontSize: "8px", color: "var(--pur)", background: "var(--pur)18", padding: "0px 4px", borderRadius: "3px" }}>rehber</span>
+                        )}
+                        {item.lateStartMin > 0 && (
+                          <span style={{ fontFamily: "var(--mono)", fontSize: "8px", color: "var(--red)" }}>{item.lateStartMin}dk gec</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                  {!isReadOnly && st === "planned" && (
+                    <button onClick={() => delFutureItem(item.id)} style={{ background: "none", color: "var(--muted)", cursor: "pointer", fontSize: "14px", padding: "0 4px", flexShrink: 0 }}>×</button>
+                  )}
+                  {isTod && (
+                    <span style={{ fontFamily: "var(--mono)", fontSize: "8px", color: "var(--acc)", background: "var(--acc)10", padding: "2px 5px", borderRadius: "3px", flexShrink: 0, marginLeft: "6px" }}>bugun</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Card>
+
+      {showGoals && (
+        <WeeklyGoalsPanel weekStart={viewWeekStart} plans={plans} onClose={() => setShowGoals(false)} />
+      )}
     </div>
   );
 }
@@ -3108,7 +3723,7 @@ function AdminPanel() {
             { l: "Gorev",   v: todos.length,        c: "var(--acc)" },
             { l: "Deneme",  v: trials.length,       c: "var(--pur)" },
             { l: "Checkin", v: checkins.length,     c: "var(--grn)" },
-            { l: "Plan Done", v: planItems.filter((x) => x.done).length, c: "var(--grn)" },
+            { l: "Plan Done", v: planItems.filter((x) => itemStatus(x) === "done").length, c: "var(--grn)" },
             { l: "Todo Done", v: todos.filter((t) => t.done).length, c: "var(--grn)" },
           ].map((x) => (
             <div key={x.l} style={{ padding: "10px", background: "var(--s2)", borderRadius: "8px", textAlign: "center" }}>

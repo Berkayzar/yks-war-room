@@ -590,3 +590,55 @@ export async function forceSummarySync(uid, data) {
     console.warn("[firebase] forceSummarySync failed:", e.code, e.message);
   }
 }
+
+// ============================================================================
+// Counselor weekly goals -- stored in student's yks_weekly_goals data key
+// Option A: reuse existing weeklyGoals structure, counselor writes directly
+// ============================================================================
+
+// Read student's weekly goals from Firestore (not localStorage -- counselor context)
+export async function getCounselorWeeklyGoals(studentUid) {
+  if (!studentUid) return [];
+  try {
+    const snap = await getDoc(doc(db, "users", studentUid, "data", "yks_weekly_goals"));
+    if (!snap.exists()) return [];
+    const raw = snap.data().v;
+    return Array.isArray(raw) ? raw : [];
+  } catch (e) {
+    console.error("getCounselorWeeklyGoals error:", e.code, e.message);
+    return [];
+  }
+}
+
+// Write weekly goals for a student as counselor
+// Merges counselor goals with existing student goals (student goals are preserved)
+export async function setCounselorWeeklyGoals(counselorUid, studentUid, newGoals) {
+  if (!counselorUid || !studentUid) return false;
+  try {
+    // Read existing goals first
+    const existing = await getCounselorWeeklyGoals(studentUid);
+    // Remove old counselor goals for the same weekStart (replace, not append)
+    const weekStarts = [...new Set(newGoals.map((g) => g.weekStart))];
+    const kept = existing.filter(
+      (g) => !(weekStarts.includes(g.weekStart) && g.createdBy === "counselor")
+    );
+    // Tag all new goals with counselor metadata
+    const tagged = newGoals.map((g) => ({
+      ...g,
+      createdBy:    "counselor",
+      counselorUid,
+      locked:       true,
+    }));
+    const merged = [...kept, ...tagged];
+    // Write to student's data key
+    await setDoc(
+      doc(db, "users", studentUid, "data", "yks_weekly_goals"),
+      { v: merged },
+      { merge: false }  // full replace of this key
+    );
+    return true;
+  } catch (e) {
+    console.error("setCounselorWeeklyGoals error:", e.code, e.message);
+    return false;
+  }
+}

@@ -1,8 +1,28 @@
 import { useEffect, useMemo, useState } from "react";
-import { getGroupStudents, addCounselorNote, getCounselorNotes, counselorGetUserData } from "./firebase.js";
+import { getGroupStudents, addCounselorNote, getCounselorNotes, counselorGetUserData, getCounselorWeeklyGoals, setCounselorWeeklyGoals } from "./firebase.js";
 
 // ============================================================================
-// Constants
+// Plan V2 helpers (mirrored from AppShell -- keep in sync)
+// ============================================================================
+function itemStatus(item) {
+  if (item.status) return item.status;
+  if (item.done)     return "done";
+  if (item.pausedAt) return "paused";
+  return "planned";
+}
+
+function validWorkedMin(item) {
+  const st = itemStatus(item);
+  if (st === "done") {
+    if (item.validSession === false) return 0;
+    return item.actualMin != null ? item.actualMin : item.durationMin || 0;
+  }
+  if (st === "paused") return item.pausedAt || 0;
+  return 0;
+}
+
+// ============================================================================
+// Business logic -- UNCHANGED
 // ============================================================================
 const RISK_WEIGHTS = {
   no_checkin_3d: 30,
@@ -13,16 +33,13 @@ const RISK_WEIGHTS = {
 };
 
 const FLAG_META = {
-  no_login_2d:   { label: "2g giris yok",    color: "var(--ora)", desc: "Son 2 gundur uygulamaya giris yapilmadi." },
-  no_checkin_3d: { label: "3g checkin yok",  color: "var(--red)", desc: "Son 3 gundur gunluk check-in yapilmadi." },
-  plan_rate_low: { label: "Plan dusuk",       color: "var(--red)", desc: "Son 7 gunluk plan uyumu %40 altinda." },
-  no_trial_7d:   { label: "7g deneme yok",   color: "var(--ora)", desc: "Son 7 gundur deneme eklenmedi." },
-  streak_broken: { label: "Streak sifir",    color: "var(--muted)", desc: "Calisma serisi sifirlanmis." },
+  no_login_2d:   { label: "2g giris yok",   desc: "Son 2 gundur uygulama acilmadi." },
+  no_checkin_3d: { label: "3g check-in yok", desc: "Son 3 gundur gunluk check-in yok." },
+  plan_rate_low: { label: "Plan dusuk",      desc: "7 gunluk plan uyumu %40 altinda." },
+  no_trial_7d:   { label: "7g deneme yok",   desc: "Son 7 gundur deneme kaydedilmedi." },
+  streak_broken: { label: "Streak sifir",    desc: "Calisma serisi kopmus." },
 };
 
-// ============================================================================
-// Utils
-// ============================================================================
 const fmtTs = (ts) => {
   if (!ts) return "--";
   const d = ts.seconds ? new Date(ts.seconds * 1000) : new Date(ts);
@@ -35,197 +52,300 @@ const fmtTs = (ts) => {
 
 const fmtDate = (iso) => {
   if (!iso) return "--";
-  return new Date(iso).toLocaleDateString("tr-TR", { day: "2-digit", month: "short" });
+  const d = new Date(iso);
+  const diff = Math.floor((Date.now() - d.getTime()) / 86400000);
+  if (diff === 0) return "bugun";
+  if (diff === 1) return "dun";
+  if (diff < 7)  return `${diff}g once`;
+  if (diff < 30) return `${Math.floor(diff / 7)}h once`;
+  return d.toLocaleDateString("tr-TR", { day: "2-digit", month: "short" });
 };
 
-// Part 4: check if student's cloud data may be stale
-// syncedAt is written by scheduleSummary -- if missing or old, warn counselor
 function isSyncStale(student) {
-  if (!student.syncedAt) return true; // never synced
-  const syncedMs = student.syncedAt?.seconds
+  if (!student.syncedAt) return true;
+  const ms = student.syncedAt?.seconds
     ? student.syncedAt.seconds * 1000
     : new Date(student.syncedAt).getTime();
-  return (Date.now() - syncedMs) > 3 * 86400000; // stale if > 3 days
+  return (Date.now() - ms) > 3 * 86400000;
 }
 
-// Compute risk from summary fields
-// FIX 11/14: only use reliable minute-based adherenceRate, no task-count fallback
 function computeRisk(student) {
   const storedFlags = student.riskFlags || [];
-
-  // Add no_login_2d from lastSeen (only available in counselor context via Firestore)
-  const lastSeenMs = student.lastSeen?.seconds
+  const lastSeenMs  = student.lastSeen?.seconds
     ? student.lastSeen.seconds * 1000
     : student.lastSeen ? new Date(student.lastSeen).getTime() : 0;
   const loginStale = lastSeenMs > 0 && (Date.now() - lastSeenMs) > 2 * 86400000;
-
   const flags = [...storedFlags];
   if (loginStale && !flags.includes("no_login_2d")) flags.push("no_login_2d");
-
   const score = flags.reduce((s, f) => s + (RISK_WEIGHTS[f] || 0), 0);
-
-  // FIX 11: only use adherenceRate (minute-based), never task-count fallback
-  const adherenceRate = typeof student.adherenceRate === "number"
-    ? student.adherenceRate
-    : 0; // safe zero -- never fabricate from task count
-
+  const adherenceRate = typeof student.adherenceRate === "number" ? student.adherenceRate : 0;
   return {
     flags,
     score,
-    level:        score >= 61 ? "high" : score >= 31 ? "mid" : "low",
+    level: score >= 61 ? "high" : score >= 31 ? "mid" : "low",
     adherenceRate,
   };
 }
 
-const RISK_COLOR = { high: "var(--red)", mid: "var(--ora)", low: "var(--grn)" };
-const RISK_LABEL = { high: "Riskli",     mid: "Dikkat",     low: "Iyi"       };
+const _planDataCache = {};
+
+// ============================================================================
+// Design tokens
+// ============================================================================
+const T = {
+  bg:      "#0A0A0F",
+  card:    "#12121A",
+  cardHov: "#16161F",
+  border:  "#1E1E2E",
+  borderL: "#252538",
+  acc:     "#6C63FF",
+  txt:     "#E8E8F0",
+  sub:     "#8888A0",
+  muted:   "#444458",
+  high:    "#FF4444",
+  mid:     "#FFB800",
+  low:     "#00C896",
+  sans:    "'Inter', 'Geist', system-ui, sans-serif",
+  mono:    "'JetBrains Mono', 'Fira Code', monospace",
+};
+
+const riskColor = (level) => ({ high: T.high, mid: T.mid, low: T.low }[level] || T.sub);
+const adherColor = (r) => r >= 70 ? T.low : r >= 40 ? T.mid : T.high;
 
 // ============================================================================
 // CSS
 // ============================================================================
 const CSS = `
-  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  :root {
-    --bg:#060606; --s1:#0e0e0e; --s2:#151515;
-    --b1:#1e1e1e; --b2:#282828;
-    --txt:#e6e6e6; --muted:#4a4a4a;
-    --acc:#e8c547; --red:#e05252; --grn:#4caf7d;
-    --blu:#5b9cf6; --pur:#a78bfa; --ora:#f59e0b;
-    --mono:'IBM Plex Mono',monospace;
-    --sans:'IBM Plex Sans',sans-serif;
+  html, body {
+    background: ${T.bg};
+    color: ${T.txt};
+    font-family: ${T.sans};
+    -webkit-font-smoothing: antialiased;
+    font-size: 14px;
   }
-  html, body { background:var(--bg); color:var(--txt); font-family:var(--sans); -webkit-font-smoothing:antialiased; }
-  button { cursor:pointer; font-family:var(--sans); border:none; transition:all .12s; }
-  button:hover:not(:disabled) { filter:brightness(1.12); }
-  input, textarea { font-family:var(--sans); background:var(--s2); border:1px solid var(--b2); color:var(--txt); border-radius:6px; }
-  input:focus, textarea:focus { outline:none; border-color:var(--acc); }
-  input::placeholder, textarea::placeholder { color:var(--muted); }
-  ::-webkit-scrollbar { width:3px; }
-  ::-webkit-scrollbar-thumb { background:var(--b2); border-radius:2px; }
-  @keyframes fadeUp  { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:none} }
-  @keyframes fadeIn  { from{opacity:0} to{opacity:1} }
+  button { cursor: pointer; font-family: inherit; border: none; background: none; }
+  button:disabled { cursor: not-allowed; opacity: 0.4; }
+  input, textarea {
+    font-family: inherit;
+    background: #0E0E16;
+    border: 1px solid ${T.border};
+    color: ${T.txt};
+    border-radius: 8px;
+    font-size: 13px;
+    transition: border-color .15s;
+  }
+  input:focus, textarea:focus { outline: none; border-color: ${T.acc}; }
+  input::placeholder, textarea::placeholder { color: ${T.muted}; }
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: ${T.border}; border-radius: 4px; }
+  @keyframes fadeUp  { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:none; } }
+  @keyframes fadeIn  { from { opacity:0; } to { opacity:1; } }
+  @keyframes spin    { to { transform: rotate(360deg); } }
   @keyframes blink   { 0%,100%{opacity:1} 50%{opacity:.3} }
-  @keyframes slideUp { from{transform:translateY(100%);opacity:0} to{transform:none;opacity:1} }
-  .fu { animation:fadeUp .2s ease both; }
-  .fi { animation:fadeIn .15s ease both; }
-  .su { animation:slideUp .25s cubic-bezier(.34,1.1,.64,1) both; }
+  .card-enter { animation: fadeUp .18s ease both; }
+  .fade-in    { animation: fadeIn .15s ease both; }
 `;
 
 // ============================================================================
 // Primitives
 // ============================================================================
-const Card = ({ children, style, className, onClick }) => (
-  <div className={className} onClick={onClick} style={{ background:"var(--s1)", border:"1px solid var(--b1)", borderRadius:"10px", padding:"14px", ...style }}>
-    {children}
-  </div>
+const Divider = ({ style }) => (
+  <div style={{ height: "1px", background: T.border, ...style }} />
 );
 
-const Label = ({ children, style }) => (
-  <p style={{ fontFamily:"var(--mono)", fontSize:"10px", fontWeight:"600", color:"var(--muted)", letterSpacing:"1.4px", textTransform:"uppercase", ...style }}>
-    {children}
-  </p>
+const Spinner = () => (
+  <div style={{
+    width: "16px", height: "16px",
+    border: `2px solid ${T.border}`,
+    borderTopColor: T.acc,
+    borderRadius: "50%",
+    animation: "spin .7s linear infinite",
+    display: "inline-block",
+  }} />
 );
 
-const PBar = ({ value, max, color = "var(--acc)", h = 4 }) => {
+const PBar = ({ value, max, color, h = 5 }) => {
   const pct = max > 0 ? Math.min((value / max) * 100, 100) : 0;
   return (
-    <div style={{ height:h, background:"var(--b1)", borderRadius:"999px", overflow:"hidden" }}>
-      <div style={{ height:"100%", width:`${pct}%`, background:color, borderRadius:"999px", transition:"width .6s ease" }} />
+    <div style={{ height: h, background: T.border, borderRadius: 999, overflow: "hidden" }}>
+      <div style={{
+        height: "100%", width: `${pct}%`,
+        background: color,
+        borderRadius: 999,
+        transition: "width .5s cubic-bezier(.4,0,.2,1)",
+      }} />
     </div>
   );
 };
 
-const RiskBadge = ({ level, score }) => {
-  const c = RISK_COLOR[level];
-  return (
-    <span style={{ fontFamily:"var(--mono)", fontSize:"9px", fontWeight:"700", padding:"2px 8px", borderRadius:"4px", background:`${c}18`, color:c, border:`1px solid ${c}44`, whiteSpace:"nowrap" }}>
-      {RISK_LABEL[level]} {score > 0 ? `· ${score}` : ""}
-    </span>
-  );
-};
+const Chip = ({ label, color }) => (
+  <span style={{
+    display: "inline-flex", alignItems: "center",
+    fontSize: "11px", fontWeight: 500,
+    padding: "3px 8px", borderRadius: "6px",
+    background: `${color}18`,
+    color,
+    border: `1px solid ${color}30`,
+    whiteSpace: "nowrap",
+    letterSpacing: ".01em",
+  }}>
+    {label}
+  </span>
+);
 
-const FlagChip = ({ flag, size = "sm" }) => {
-  const meta  = FLAG_META[flag] || { label: flag, color: "var(--muted)", desc: "" };
-  const fsize = size === "sm" ? "8px" : "10px";
+const Btn = ({ children, onClick, variant = "ghost", disabled, style }) => {
+  const styles = {
+    ghost:   { background: "transparent", color: T.sub, border: `1px solid ${T.border}` },
+    primary: { background: T.acc, color: "#fff", fontWeight: 600 },
+    subtle:  { background: T.card, color: T.txt, border: `1px solid ${T.border}` },
+  };
   return (
-    <span title={meta.desc} style={{ fontFamily:"var(--mono)", fontSize:fsize, padding:"2px 6px", borderRadius:"3px", background:`${meta.color}14`, color:meta.color, border:`1px solid ${meta.color}33`, whiteSpace:"nowrap", cursor:"help" }}>
-      {meta.label}
-    </span>
+    <button onClick={onClick} disabled={disabled}
+      style={{
+        ...styles[variant],
+        padding: "7px 14px", borderRadius: "8px", fontSize: "13px",
+        transition: "all .12s", display: "inline-flex", alignItems: "center", gap: "6px",
+        ...style,
+      }}
+      onMouseOver={(e) => { if (!disabled) e.currentTarget.style.opacity = ".82"; }}
+      onMouseOut={(e)  => { e.currentTarget.style.opacity = "1"; }}>
+      {children}
+    </button>
   );
 };
 
 // ============================================================================
-// Student card
+// StudentCard
 // ============================================================================
 function StudentCard({ student, onClick }) {
-  const risk = computeRisk(student);
-  const borderColor = risk.level === "high" ? "var(--red)33" : risk.level === "mid" ? "var(--ora)22" : "var(--b1)";
+  const risk  = computeRisk(student);
+  const color = riskColor(risk.level);
+  const stale = isSyncStale(student);
+
+  // Last trial display
+  const lastTrialText = student.lastTrialDate
+    ? `${student.lastTrialNet ?? "--"} net · ${fmtDate(student.lastTrialDate)}`
+    : "Deneme yok";
 
   return (
-    <div className="fu" onClick={onClick}
-      style={{ padding:"13px 14px", background:"var(--s1)", border:`1px solid ${borderColor}`, borderRadius:"10px", cursor:"pointer", transition:"border-color .2s" }}
-      onMouseEnter={(e) => e.currentTarget.style.borderColor = "var(--acc)55"}
-      onMouseLeave={(e) => e.currentTarget.style.borderColor = borderColor}>
+    <div className="card-enter"
+      onClick={onClick}
+      style={{
+        display: "flex",
+        background: T.card,
+        border: `1px solid ${T.border}`,
+        borderRadius: "12px",
+        overflow: "hidden",
+        cursor: "pointer",
+        transition: "transform .12s, border-color .12s, box-shadow .12s",
+        position: "relative",
+      }}
+      onMouseEnter={(e) => {
+        e.currentTarget.style.transform = "translateY(-1px)";
+        e.currentTarget.style.borderColor = `${T.acc}55`;
+        e.currentTarget.style.boxShadow = `0 4px 24px rgba(108,99,255,.08)`;
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.transform = "none";
+        e.currentTarget.style.borderColor = T.border;
+        e.currentTarget.style.boxShadow = "none";
+      }}>
 
-      {/* Top */}
-      <div style={{ display:"flex", alignItems:"center", gap:"10px", marginBottom:"10px" }}>
-        {student.photoURL
-          ? <img src={student.photoURL} alt="" style={{ width:"32px", height:"32px", borderRadius:"50%", flexShrink:0 }} />
-          : <div style={{ width:"32px", height:"32px", borderRadius:"50%", background:"var(--b2)", flexShrink:0, display:"flex", alignItems:"center", justifyContent:"center", fontSize:"13px", color:"var(--muted)", fontWeight:"600" }}>{(student.displayName||"?")[0].toUpperCase()}</div>
-        }
-        <div style={{ flex:1, minWidth:0 }}>
-          <p style={{ fontSize:"13px", fontWeight:"500", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
-            {student.displayName || student.email || "Isimsiz"}
-          </p>
-          <p style={{ fontFamily:"var(--mono)", fontSize:"9px", color:"var(--muted)", marginTop:"1px" }}>
-            {fmtTs(student.lastSeen)}
-          </p>
-        </div>
-        <RiskBadge level={risk.level} score={risk.score} />
-      </div>
+      {/* Left color bar */}
+      <div style={{ width: "3px", background: color, flexShrink: 0 }} />
 
-      {/* Stats */}
-      <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:"5px", marginBottom:"8px" }}>
-        {[
-          // FIX 10: weeklyActiveDays more useful than XP for counselor
-          { l:"Haf.Gun", v: student.weeklyActiveDays ?? "--",        c: (student.weeklyActiveDays||0) >= 5 ? "var(--grn)" : (student.weeklyActiveDays||0) >= 3 ? "var(--acc)" : "var(--red)" },
-          { l:"Streak",  v: `🔥${student.streak || 0}`,             c: student.streak > 0 ? "var(--acc)" : "var(--muted)" },
-          { l:"Deneme",  v: student.trialCount || 0,                 c:"var(--blu)" },
-          { l:"Plan%",   v: `${risk.adherenceRate}%`,                c: risk.adherenceRate >= 70 ? "var(--grn)" : risk.adherenceRate >= 40 ? "var(--acc)" : "var(--red)" },
-        ].map((x) => (
-          <div key={x.l} style={{ textAlign:"center", padding:"5px 3px", background:"var(--s2)", borderRadius:"5px" }}>
-            <p style={{ fontFamily:"var(--mono)", fontSize:"12px", fontWeight:"700", color:x.c, lineHeight:1 }}>{x.v}</p>
-            <p style={{ fontSize:"8px", color:"var(--muted)", marginTop:"2px" }}>{x.l}</p>
+      {/* Content */}
+      <div style={{ flex: 1, padding: "16px 18px", minWidth: 0 }}>
+        {/* Top row */}
+        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: "12px", gap: "12px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "10px", minWidth: 0 }}>
+            {/* Avatar */}
+            {student.photoURL
+              ? <img src={student.photoURL} alt="" style={{ width: 36, height: 36, borderRadius: "50%", flexShrink: 0, border: `2px solid ${T.border}` }} />
+              : <div style={{
+                  width: 36, height: 36, borderRadius: "50%", flexShrink: 0,
+                  background: `${color}20`, border: `2px solid ${color}40`,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  fontSize: "14px", fontWeight: 700, color,
+                }}>
+                  {(student.displayName || "?")[0].toUpperCase()}
+                </div>
+            }
+            <div style={{ minWidth: 0 }}>
+              <p style={{ fontWeight: 600, fontSize: "14px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: T.txt }}>
+                {student.displayName || student.email || "Isimsiz"}
+              </p>
+              <p style={{ fontSize: "12px", color: T.sub, marginTop: "2px" }}>
+                {student.groupId ? `Grup: ${student.groupId}` : "Grup atanmadi"}
+                {" · "}
+                {fmtTs(student.lastSeen)}
+              </p>
+            </div>
           </div>
-        ))}
-      </div>
-
-      {/* Plan bar */}
-      <PBar value={risk.adherenceRate} max={100}
-        color={risk.adherenceRate >= 70 ? "var(--grn)" : risk.adherenceRate >= 40 ? "var(--acc)" : "var(--red)"}
-        h={3} />
-
-      {/* Risk flags */}
-      {risk.flags.length > 0 && (
-        <div style={{ display:"flex", gap:"4px", flexWrap:"wrap", marginTop:"7px" }}>
-          {risk.flags.map((f) => <FlagChip key={f} flag={f} />)}
-        </div>
-      )}
-      {/* Part 4: stale data warning */}
-      {isSyncStale(student) && (
-        <div style={{ marginTop:"6px", padding:"3px 7px", background:"var(--muted)10", border:"1px solid var(--muted)22", borderRadius:"4px" }}>
-          <span style={{ fontFamily:"var(--mono)", fontSize:"8px", color:"var(--muted)" }}>
-            veri guncel olmayabilir -- ogrenci son {Math.floor((Date.now() - (student.syncedAt?.seconds ? student.syncedAt.seconds*1000 : 0)) / 86400000)}g sync yapmadi
+          {/* Risk badge */}
+          <span style={{
+            fontSize: "11px", fontWeight: 600,
+            padding: "4px 10px", borderRadius: "20px",
+            background: `${color}15`, color, border: `1px solid ${color}30`,
+            flexShrink: 0, letterSpacing: ".02em",
+          }}>
+            {risk.level === "high" ? "Riskli" : risk.level === "mid" ? "Dikkat" : "Iyi"}
           </span>
         </div>
-      )}
+
+        {/* Middle: trial + plan */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "12px" }}>
+          {/* Last trial */}
+          <div>
+            <p style={{ fontSize: "11px", color: T.muted, marginBottom: "3px", textTransform: "uppercase", letterSpacing: ".06em", fontWeight: 600 }}>Son Deneme</p>
+            <p style={{ fontSize: "13px", color: student.lastTrialDate ? T.txt : T.muted, fontWeight: student.lastTrialDate ? 500 : 400 }}>
+              {lastTrialText}
+            </p>
+          </div>
+          {/* Weekly activity */}
+          <div>
+            <p style={{ fontSize: "11px", color: T.muted, marginBottom: "3px", textTransform: "uppercase", letterSpacing: ".06em", fontWeight: 600 }}>Hafta Aktif</p>
+            <p style={{ fontSize: "13px", color: T.txt, fontWeight: 500 }}>
+              {student.weeklyActiveDays ?? 0}
+              <span style={{ color: T.muted, fontWeight: 400 }}>/7 gun</span>
+            </p>
+          </div>
+        </div>
+
+        {/* Plan adherence bar */}
+        <div style={{ marginBottom: "10px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "5px" }}>
+            <p style={{ fontSize: "11px", color: T.muted, textTransform: "uppercase", letterSpacing: ".06em", fontWeight: 600 }}>Plan Uyumu</p>
+            <p style={{ fontSize: "12px", fontWeight: 600, color: adherColor(risk.adherenceRate) }}>
+              %{risk.adherenceRate}
+            </p>
+          </div>
+          <PBar value={risk.adherenceRate} max={100} color={adherColor(risk.adherenceRate)} h={4} />
+        </div>
+
+        {/* Bottom: flags */}
+        {(risk.flags.length > 0 || stale) && (
+          <div style={{ display: "flex", gap: "5px", flexWrap: "wrap" }}>
+            {risk.flags.map((f) => {
+              const meta  = FLAG_META[f] || { label: f };
+              const fc    = f === "plan_rate_low" || f === "no_checkin_3d" ? T.high
+                          : f === "no_trial_7d"   || f === "no_login_2d"  ? T.mid
+                          : T.muted;
+              return <Chip key={f} label={meta.label} color={fc} />;
+            })}
+            {stale && <Chip label="Veri eski" color={T.muted} />}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
 
 // ============================================================================
-// Counselor Notes section
+// CounselorNotes
 // ============================================================================
 function CounselorNotes({ studentUid, counselorUid }) {
   const [notes,   setNotes]   = useState([]);
@@ -243,12 +363,7 @@ function CounselorNotes({ studentUid, counselorUid }) {
     setSaving(true);
     const id = await addCounselorNote(counselorUid, studentUid, text);
     if (id) {
-      setNotes((p) => [{
-        id,
-        counselorUid,
-        text: text.trim(),
-        createdAt: { seconds: Math.floor(Date.now() / 1000) },
-      }, ...p]);
+      setNotes((p) => [{ id, counselorUid, text: text.trim(), createdAt: { seconds: Math.floor(Date.now() / 1000) } }, ...p]);
       setText("");
     }
     setSaving(false);
@@ -256,35 +371,30 @@ function CounselorNotes({ studentUid, counselorUid }) {
 
   return (
     <div>
-      <Label style={{ marginBottom:"8px" }}>Rehberlik Notlari</Label>
-
-      {/* Input */}
-      <div style={{ display:"flex", gap:"6px", marginBottom:"10px" }}>
+      <p style={{ fontSize: "13px", fontWeight: 600, color: T.txt, marginBottom: "12px" }}>Notlar</p>
+      <div style={{ display: "flex", gap: "8px", marginBottom: "14px" }}>
         <textarea
           value={text}
           onChange={(e) => setText(e.target.value)}
-          placeholder="Not ekle..."
+          placeholder="Ogrenci icin not ekle..."
           rows={2}
-          style={{ flex:1, padding:"8px 10px", fontSize:"12px", resize:"none", borderRadius:"7px", lineHeight:"1.5" }}
+          style={{ flex: 1, padding: "10px 12px", resize: "none", lineHeight: 1.5, borderRadius: "8px" }}
+          onKeyDown={(e) => { if (e.key === "Enter" && e.metaKey) handleAdd(); }}
         />
-        <button onClick={handleAdd} disabled={saving || !text.trim()}
-          style={{ padding:"8px 14px", background:"var(--acc)", color:"#000", fontWeight:"700", fontSize:"12px", borderRadius:"7px", cursor: saving || !text.trim() ? "not-allowed" : "pointer", opacity: saving || !text.trim() ? 0.5 : 1, flexShrink:0 }}>
-          {saving ? "..." : "Ekle"}
-        </button>
+        <Btn variant="primary" onClick={handleAdd} disabled={saving || !text.trim()}
+          style={{ alignSelf: "flex-end", padding: "10px 16px" }}>
+          {saving ? <Spinner /> : "Ekle"}
+        </Btn>
       </div>
-
-      {/* Notes list */}
-      {loading && <p style={{ fontFamily:"var(--mono)", fontSize:"10px", color:"var(--muted)", animation:"blink 1.5s ease infinite" }}>Yukleniyor...</p>}
+      {loading && <div style={{ display: "flex", justifyContent: "center", padding: "12px" }}><Spinner /></div>}
       {!loading && notes.length === 0 && (
-        <p style={{ fontFamily:"var(--mono)", fontSize:"10px", color:"var(--muted)" }}>Henuz not yok.</p>
+        <p style={{ fontSize: "13px", color: T.muted, textAlign: "center", padding: "12px 0" }}>Henuz not eklenmemis.</p>
       )}
-      <div style={{ display:"flex", flexDirection:"column", gap:"6px" }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
         {notes.map((n) => (
-          <div key={n.id} style={{ padding:"8px 10px", background:"var(--s2)", borderRadius:"7px", border:"1px solid var(--b2)" }}>
-            <p style={{ fontSize:"12px", lineHeight:"1.5", color:"var(--txt)" }}>{n.text}</p>
-            <p style={{ fontFamily:"var(--mono)", fontSize:"9px", color:"var(--muted)", marginTop:"4px" }}>
-              {fmtTs(n.createdAt)}
-            </p>
+          <div key={n.id} style={{ padding: "12px 14px", background: "#0E0E16", border: `1px solid ${T.border}`, borderRadius: "10px" }}>
+            <p style={{ fontSize: "13px", lineHeight: 1.6, color: T.txt, marginBottom: "6px" }}>{n.text}</p>
+            <p style={{ fontSize: "11px", color: T.muted }}>{fmtTs(n.createdAt)}</p>
           </div>
         ))}
       </div>
@@ -292,135 +402,105 @@ function CounselorNotes({ studentUid, counselorUid }) {
   );
 }
 
-// FIX 12: module-level cache -- keyed by uid, cleared after 5 minutes
-const _planDataCache = {};
-
 // ============================================================================
-// Weekly plan breakdown -- fetches raw yks_plan for a student
+// WeeklyPlanBreakdown
 // ============================================================================
 function WeeklyPlanBreakdown({ studentUid }) {
   const [data,    setData]    = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // FIX 12: use cache to avoid refetch on every modal open
     const cached = _planDataCache[studentUid];
     if (cached && Date.now() - cached.ts < 5 * 60 * 1000) {
-      setData(cached.data);
-      setLoading(false);
-      return;
+      setData(cached.data); setLoading(false); return;
     }
     setLoading(true);
     counselorGetUserData(studentUid).then((d) => {
       _planDataCache[studentUid] = { data: d, ts: Date.now() };
-      setData(d);
-      setLoading(false);
+      setData(d); setLoading(false);
     });
   }, [studentUid]);
 
   const last7 = Array.from({ length: 7 }, (_, i) => {
     const d = new Date(Date.now() - i * 86400000);
-    return {
-      date:  d.toISOString().slice(0, 10),
-      label: d.toLocaleDateString("tr-TR", { weekday: "short", day: "numeric", month: "short" }),
-    };
+    return { date: d.toISOString().slice(0, 10), label: d.toLocaleDateString("tr-TR", { weekday: "short", day: "numeric" }) };
   }).reverse();
 
-  if (loading) return (
-    <p style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--muted)", animation: "blink 1.5s ease infinite" }}>
-      Yukleniyor...
-    </p>
-  );
+  if (loading) return <div style={{ display: "flex", justifyContent: "center", padding: "20px" }}><Spinner /></div>;
 
   const plans = data?.data?.yks_plan || {};
-
   const totalStudyMin = last7.reduce((s, { date }) =>
-    s + (plans[date] || [])
-      .filter((x) => x.done)
-      .reduce((a, x) => a + (x.actualMin || x.durationMin || 0), 0)
-  , 0);
+    s + (plans[date] || []).reduce((a, x) => a + validWorkedMin(x), 0), 0);
 
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
-        <Label>Son 7 Gun Calisma Detayi</Label>
-        <span style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--acc)" }}>
-          Toplam: {Math.floor(totalStudyMin / 60)}s {totalStudyMin % 60}dk
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px" }}>
+        <p style={{ fontSize: "13px", fontWeight: 600, color: T.txt }}>Son 7 Gun</p>
+        <span style={{ fontSize: "12px", color: T.acc, fontWeight: 600 }}>
+          {Math.floor(totalStudyMin / 60)}s {totalStudyMin % 60}dk toplam
         </span>
       </div>
-
       <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
         {last7.map(({ date, label }) => {
-          const items = plans[date] || [];
-          const doneItems = items.filter((x) => x.done);
-          const totalMin  = items.reduce((s, x) => s + (x.durationMin || 0), 0);
-          const doneMin   = doneItems.reduce((s, x) => s + (x.actualMin || x.durationMin || 0), 0);
-          const rate      = totalMin > 0 ? Math.round((doneMin / totalMin) * 100) : null;
-          const isToday   = date === new Date().toISOString().slice(0, 10);
+          const items    = plans[date] || [];
+          const totalMin = items.reduce((s, x) => s + (x.durationMin || 0), 0);
+          const doneMin  = items.reduce((a, x) => a + validWorkedMin(x), 0);
+          const rate    = totalMin > 0 ? Math.round((doneMin / totalMin) * 100) : null;
+          const isToday = date === new Date().toISOString().slice(0, 10);
+          const dc      = rate === null ? T.muted : adherColor(rate);
 
           return (
-            <div key={date} style={{ padding: "9px 11px", background: "var(--s2)", borderRadius: "7px", border: `1px solid ${isToday ? "var(--acc)33" : "var(--b2)"}` }}>
-              {/* Day header */}
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: items.length > 0 ? "7px" : "0" }}>
-                <span style={{ fontFamily: "var(--mono)", fontSize: "10px", color: isToday ? "var(--acc)" : "var(--muted)" }}>
-                  {label}{isToday ? " (bugun)" : ""}
+            <div key={date} style={{
+              padding: "10px 14px",
+              background: isToday ? `${T.acc}08` : "#0E0E16",
+              border: `1px solid ${isToday ? `${T.acc}30` : T.border}`,
+              borderRadius: "9px",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: items.length > 0 ? "8px" : 0 }}>
+                <span style={{ fontSize: "12px", color: isToday ? T.acc : T.sub, fontWeight: isToday ? 600 : 400 }}>
+                  {label}{isToday ? " · bugun" : ""}
                 </span>
-                {rate !== null ? (
-                  <span style={{ fontFamily: "var(--mono)", fontSize: "10px", color: rate >= 70 ? "var(--grn)" : rate >= 40 ? "var(--acc)" : "var(--red)" }}>
-                    {doneMin}dk / {totalMin}dk · %{rate}
-                  </span>
-                ) : (
-                  <span style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)" }}>plan yok</span>
-                )}
+                {rate !== null
+                  ? <span style={{ fontSize: "12px", fontWeight: 600, color: dc }}>{doneMin}dk / {totalMin}dk · %{rate}</span>
+                  : <span style={{ fontSize: "12px", color: T.muted }}>plan yok</span>
+                }
               </div>
-
-              {/* Plan items */}
               {items.length > 0 && (
                 <div style={{ display: "flex", flexDirection: "column", gap: "3px" }}>
-                  {items.map((item, i) => {
-                    const isEarly = item.done && item.actualMin != null && item.actualMin < item.durationMin;
-                    const statusColor = !item.done ? "var(--muted)"
-                      : isEarly ? "var(--ora)"
-                      : "var(--grn)";
-                    const statusIcon = !item.done ? "○" : isEarly ? "◑" : "●";
-
+                {items.map((item, i) => {
+                    const st      = itemStatus(item);
+                    const isDone  = st === "done";
+                    const isPaused = st === "paused";
+                    const isEarly = isDone && item.actualMin != null && item.actualMin < item.durationMin;
+                    const ic   = !isDone && !isPaused ? T.muted : isEarly || isPaused ? T.mid : T.low;
+                    const icon = !isDone && !isPaused ? "○" : isPaused ? "◔" : isEarly ? "◑" : "●";
                     return (
-                      <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "4px 7px", background: "var(--s1)", borderRadius: "5px" }}>
-                        <div style={{ display: "flex", gap: "7px", alignItems: "center", minWidth: 0 }}>
-                          <span style={{ fontFamily: "var(--mono)", fontSize: "11px", color: statusColor, flexShrink: 0 }}>{statusIcon}</span>
-                          <span style={{ fontSize: "11px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: item.done ? "var(--txt)" : "var(--muted)" }}>
+                      <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "4px 0" }}>
+                        <div style={{ display: "flex", gap: "8px", alignItems: "center", minWidth: 0 }}>
+                          <span style={{ fontSize: "12px", color: ic, flexShrink: 0 }}>{icon}</span>
+                          <span style={{ fontSize: "12px", color: isDone ? T.txt : T.sub, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                             {item.subject}
                           </span>
                           {item.kind === "trial" && (
-                            <span style={{ fontFamily: "var(--mono)", fontSize: "8px", color: "var(--blu)", background: "var(--blu)15", padding: "1px 5px", borderRadius: "3px", flexShrink: 0 }}>
+                            <span style={{ fontSize: "10px", color: "#5b9cf6", background: "#5b9cf615", padding: "1px 6px", borderRadius: "4px", flexShrink: 0 }}>
                               {item.trialType || "TYT"}
                             </span>
                           )}
                         </div>
                         <div style={{ display: "flex", gap: "5px", alignItems: "center", flexShrink: 0 }}>
-                          {item.done && item.actualMin != null && item.actualMin !== item.durationMin ? (
-                            <span style={{ fontFamily: "var(--mono)", fontSize: "9px", color: isEarly ? "var(--ora)" : "var(--grn)" }}>
-                              {item.actualMin}dk / {item.durationMin}dk
-                            </span>
-                          ) : (
-                            <span style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)" }}>
-                              {item.durationMin}dk
-                            </span>
-                          )}
-                          {isEarly && (
-                            <span style={{ fontFamily: "var(--mono)", fontSize: "8px", color: "var(--ora)", background: "var(--ora)15", padding: "1px 5px", borderRadius: "3px" }}>
-                              mola
-                            </span>
-                          )}
-                          {item.lateStartMin > 0 && (
-                            <span style={{ fontFamily: "var(--mono)", fontSize: "8px", color: "var(--red)", background: "var(--red)10", padding: "1px 5px", borderRadius: "3px" }}>
-                              {item.lateStartMin}dk gec
-                            </span>
-                          )}
+                          <span style={{ fontSize: "11px", color: T.muted }}>
+                            {isDone && item.actualMin != null && item.actualMin !== item.durationMin
+                              ? `${item.actualMin}/${item.durationMin}dk`
+                              : isPaused
+                              ? `${item.pausedAt || 0}/${item.durationMin}dk`
+                              : `${item.durationMin}dk`}
+                          </span>
+                          {isEarly    && <Chip label="erken" color={T.mid} />}
+                          {isPaused   && <Chip label="mola" color={T.mid} />}
+                          {item.lateStartMin > 0 && <Chip label={`${item.lateStartMin}dk gec`} color={T.high} />}
                           {item.sessionTopic?.feeling && (
-                            <span style={{ fontFamily: "var(--mono)", fontSize: "8px", color: item.sessionTopic.feeling === "iyi" ? "var(--grn)" : item.sessionTopic.feeling === "zor" ? "var(--red)" : "var(--acc)", background: "var(--s2)", padding: "1px 5px", borderRadius: "3px" }}>
-                              {item.sessionTopic.feeling}
-                            </span>
+                            <Chip label={item.sessionTopic.feeling}
+                              color={item.sessionTopic.feeling === "iyi" ? T.low : item.sessionTopic.feeling === "zor" ? T.high : T.mid} />
                           )}
                         </div>
                       </div>
@@ -437,118 +517,347 @@ function WeeklyPlanBreakdown({ studentUid }) {
 }
 
 // ============================================================================
-// Student Detail Modal
+// StudentDetailModal
 // ============================================================================
-function StudentDetailModal({ student, counselorUid, onClose }) {
-  const risk = computeRisk(student);
+// ============================================================================
+// CounselorWeeklyGoals -- counselor sets weekly subject goals for a student
+// ============================================================================
+const SUBJECTS_LIST = ["Matematik","Fizik","Kimya","Biyoloji","Turkce","Edebiyat","Tarih","Cografya","Felsefe","Diger"];
+
+function CounselorWeeklyGoals({ studentUid, counselorUid, studentSummary }) {
+  const [goals,    setGoals]   = useState([]);
+  const [loading,  setLoading] = useState(true);
+  const [saving,   setSaving]  = useState(false);
+  const [saved,    setSaved]   = useState(false);
+  const [err,      setErr]     = useState("");
+
+  // Week navigation: default to current week
+  const [weekStart, setWeekStart] = useState(() => {
+    const d = new Date();
+    const day = d.getDay();
+    const diff = day === 0 ? -6 : 1 - day;
+    d.setDate(d.getDate() + diff);
+    return d.toISOString().slice(0, 10);
+  });
+
+  // New goal form
+  const [subject,  setSubject]  = useState("");
+  const [hours,    setHours]    = useState("3");
+
+  const getMonday = (offset) => {
+    const d = new Date(weekStart);
+    d.setDate(d.getDate() + offset * 7);
+    return d.toISOString().slice(0, 10);
+  };
+
+  useEffect(() => {
+    setLoading(true);
+    setGoals([]);
+    getCounselorWeeklyGoals(studentUid).then((all) => {
+      setGoals(all.filter((g) => g.weekStart === weekStart && g.createdBy === "counselor"));
+      setLoading(false);
+    });
+  }, [studentUid, weekStart]);
+
+  const addGoal = () => {
+    if (!subject || !hours) return;
+    const targetMin = Math.round(parseFloat(hours) * 60);
+    if (isNaN(targetMin) || targetMin <= 0) return;
+    // Prevent duplicate subject for same week
+    if (goals.some((g) => g.subject === subject)) {
+      setErr(`${subject} bu hafta icin zaten var. Oncelikleri kaldirin.`);
+      return;
+    }
+    setErr("");
+    setGoals((p) => [...p, {
+      id:           `cg_${Date.now()}_${Math.random().toString(36).slice(2,6)}`,
+      weekStart,
+      subject,
+      targetMin,
+      createdBy:    "counselor",
+      counselorUid,
+      locked:       true,
+    }]);
+    setSubject("");
+    setHours("3");
+    setSaved(false);
+  };
+
+  const removeGoal = (id) => {
+    setGoals((p) => p.filter((g) => g.id !== id));
+    setSaved(false);
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    setErr("");
+    const ok = await setCounselorWeeklyGoals(counselorUid, studentUid, goals);
+    if (ok) {
+      setSaved(true);
+      setTimeout(() => setSaved(false), 3000);
+    } else {
+      setErr("Kaydedilemedi. Firestore rules kontrol et.");
+    }
+    setSaving(false);
+  };
+
+  const weekLabel = new Date(weekStart + "T12:00:00").toLocaleDateString("tr-TR", { day: "numeric", month: "long" });
 
   return (
-    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.82)", display:"flex", alignItems:"flex-end", justifyContent:"center", zIndex:200, padding:0 }}
-      onClick={onClose}>
-      <div className="su"
-        onClick={(e) => e.stopPropagation()}
-        style={{ background:"var(--s1)", border:"1px solid var(--b1)", borderRadius:"14px 14px 0 0", padding:"20px", width:"100%", maxWidth:"580px", maxHeight:"88vh", overflowY:"auto" }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
 
-        {/* Header */}
-        <div style={{ display:"flex", alignItems:"center", gap:"12px", marginBottom:"16px" }}>
-          {student.photoURL
-            ? <img src={student.photoURL} alt="" style={{ width:"40px", height:"40px", borderRadius:"50%", flexShrink:0 }} />
-            : <div style={{ width:"40px", height:"40px", borderRadius:"50%", background:"var(--b2)", flexShrink:0, display:"flex", alignItems:"center", justifyContent:"center", fontSize:"16px", fontWeight:"700" }}>{(student.displayName||"?")[0].toUpperCase()}</div>
-          }
-          <div style={{ flex:1, minWidth:0 }}>
-            <p style={{ fontSize:"15px", fontWeight:"600" }}>{student.displayName || "Isimsiz"}</p>
-            <p style={{ fontFamily:"var(--mono)", fontSize:"9px", color:"var(--muted)", marginTop:"1px" }}>{student.email}</p>
-          </div>
-          <RiskBadge level={risk.level} score={risk.score} />
-          <button onClick={onClose} style={{ background:"none", color:"var(--muted)", fontSize:"20px", padding:"0 4px", flexShrink:0 }}>×</button>
+      {/* Week navigation */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <button onClick={() => setWeekStart(getMonday(-1))}
+          style={{ color: T.sub, fontSize: "18px", cursor: "pointer", background: "none", padding: "4px 8px" }}>‹</button>
+        <div style={{ textAlign: "center" }}>
+          <p style={{ fontSize: "13px", fontWeight: 600, color: T.txt }}>{weekLabel} haftasi</p>
+          <p style={{ fontSize: "11px", color: T.muted, marginTop: "2px" }}>{weekStart}</p>
         </div>
+        <button onClick={() => setWeekStart(getMonday(1))}
+          style={{ color: T.sub, fontSize: "18px", cursor: "pointer", background: "none", padding: "4px 8px" }}>›</button>
+      </div>
 
-        {/* Stats grid */}
-        <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:"7px", marginBottom:"14px" }}>
-          {[
-            { l:"XP",         v: student.xp           || 0,    c:"var(--pur)" },
-            { l:"Streak",     v: `🔥 ${student.streak || 0}`,  c: student.streak > 0 ? "var(--acc)" : "var(--muted)" },
-            { l:"Plan Uyumu", v: `%${risk.adherenceRate}`,      c: risk.adherenceRate >= 70 ? "var(--grn)" : risk.adherenceRate >= 40 ? "var(--acc)" : "var(--red)" },
-            { l:"Deneme",     v: student.trialCount   || 0,    c:"var(--blu)" },
-            { l:"Checkin",    v: student.checkinCount || 0,    c:"var(--grn)" },
-            { l:"Haf. Gun",   v: student.weeklyActiveDays || 0, c:"var(--acc)" },
-          ].map((x) => (
-            <div key={x.l} style={{ padding:"9px", background:"var(--s2)", borderRadius:"7px", textAlign:"center" }}>
-              <p style={{ fontFamily:"var(--mono)", fontSize:"17px", fontWeight:"700", color:x.c }}>{x.v}</p>
-              <p style={{ fontSize:"9px", color:"var(--muted)", marginTop:"2px" }}>{x.l}</p>
+      {/* Current goals list */}
+      {loading && (
+        <div style={{ display: "flex", justifyContent: "center", padding: "16px" }}><Spinner /></div>
+      )}
+
+      {!loading && goals.length === 0 && (
+        <div style={{ padding: "16px", background: "#0E0E16", borderRadius: "10px", border: `1px solid ${T.border}`, textAlign: "center" }}>
+          <p style={{ fontSize: "13px", color: T.muted }}>Bu hafta icin hedef belirlenmemis.</p>
+        </div>
+      )}
+
+      {!loading && goals.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+          {goals.map((g) => (
+            <div key={g.id} style={{ display: "flex", alignItems: "center", gap: "12px", padding: "10px 14px", background: "#0E0E16", borderRadius: "10px", border: `1px solid ${T.border}` }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <p style={{ fontSize: "13px", fontWeight: 500, color: T.txt }}>{g.subject}</p>
+                <p style={{ fontSize: "11px", color: T.muted, marginTop: "2px" }}>
+                  Hedef: {Math.floor(g.targetMin / 60)}s {g.targetMin % 60}dk
+                </p>
+              </div>
+              <button onClick={() => removeGoal(g.id)}
+                style={{ color: T.muted, fontSize: "18px", cursor: "pointer", background: "none", flexShrink: 0 }}>×</button>
             </div>
           ))}
         </div>
+      )}
 
-        {/* Plan bar */}
-        <div style={{ marginBottom:"14px" }}>
-          <div style={{ display:"flex", justifyContent:"space-between", marginBottom:"5px" }}>
-            <Label>Plan Uyumu (7g)</Label>
-            <span style={{ fontFamily:"var(--mono)", fontSize:"10px", color: risk.adherenceRate >= 70 ? "var(--grn)" : risk.adherenceRate >= 40 ? "var(--acc)" : "var(--red)" }}>%{risk.adherenceRate}</span>
+      {/* Add goal form */}
+      <div style={{ padding: "14px 16px", background: "#0E0E16", borderRadius: "12px", border: `1px solid ${T.border}` }}>
+        <p style={{ fontSize: "12px", fontWeight: 600, color: T.txt, marginBottom: "10px", textTransform: "uppercase", letterSpacing: ".04em" }}>
+          Hedef Ekle
+        </p>
+        <div style={{ display: "flex", gap: "8px", marginBottom: "8px" }}>
+          <select value={subject} onChange={(e) => setSubject(e.target.value)}
+            style={{ flex: 2, padding: "8px 10px", fontSize: "13px", borderRadius: "8px" }}>
+            <option value="">Ders sec...</option>
+            {SUBJECTS_LIST.map((s) => <option key={s} value={s}>{s}</option>)}
+          </select>
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", flex: 1 }}>
+            <input value={hours} onChange={(e) => setHours(e.target.value)}
+              type="number" min="0.5" max="20" step="0.5"
+              style={{ width: "60px", padding: "8px 8px", fontSize: "13px", textAlign: "center", borderRadius: "8px" }} />
+            <span style={{ fontSize: "12px", color: T.muted, flexShrink: 0 }}>saat</span>
           </div>
-          <PBar value={risk.adherenceRate} max={100}
-            color={risk.adherenceRate >= 70 ? "var(--grn)" : risk.adherenceRate >= 40 ? "var(--acc)" : "var(--red)"}
-            h={6} />
+        </div>
+        <button onClick={addGoal} disabled={!subject || !hours}
+          style={{
+            width: "100%", padding: "9px", borderRadius: "8px", fontSize: "13px", fontWeight: 600,
+            background: subject && hours ? T.acc : T.border,
+            color: subject && hours ? "#fff" : T.muted,
+            cursor: subject && hours ? "pointer" : "not-allowed",
+            transition: "background .15s",
+          }}>
+          + Hedef Ekle
+        </button>
+      </div>
+
+      {err && (
+        <p style={{ fontSize: "12px", color: T.high, padding: "8px 12px", background: `${T.high}10`, borderRadius: "8px" }}>
+          {err}
+        </p>
+      )}
+
+      {/* Save button */}
+      {goals.length > 0 && (
+        <button onClick={handleSave} disabled={saving}
+          style={{
+            width: "100%", padding: "11px", borderRadius: "10px", fontSize: "14px", fontWeight: 700,
+            background: saved ? T.low : T.acc,
+            color: "#fff",
+            cursor: saving ? "not-allowed" : "pointer",
+            transition: "background .2s",
+            opacity: saving ? 0.7 : 1,
+          }}>
+          {saving ? "Kaydediliyor..." : saved ? "Kaydedildi ✓" : "Hedefleri Kaydet"}
+        </button>
+      )}
+
+      <p style={{ fontSize: "11px", color: T.muted, textAlign: "center", lineHeight: 1.5 }}>
+        Kaydedilen hedefler ogrenci WeekTab'inda goruntulenir.<br />
+        Ogrenci bu hedefleri silemez.
+      </p>
+    </div>
+  );
+}
+
+function StudentDetailModal({ student, counselorUid, onClose }) {
+  const risk  = computeRisk(student);
+  const color = riskColor(risk.level);
+  const stale = isSyncStale(student);
+  const [tab, setTab] = useState("overview"); // overview | plan | notes
+
+  const TABS = [
+    { key: "overview", label: "Genel" },
+    { key: "goals",    label: "Hedefler" },
+    { key: "plan",     label: "Plan Detayi" },
+    { key: "notes",    label: "Notlar" },
+  ];
+
+  const stats = [
+    { label: "Plan Uyumu",  value: `%${risk.adherenceRate}`, color: adherColor(risk.adherenceRate) },
+    { label: "Hafta Aktif", value: `${student.weeklyActiveDays ?? 0}/7`, color: T.txt },
+    { label: "Deneme",      value: student.trialCount || 0,  color: T.txt },
+    { label: "Check-in",    value: student.checkinCount || 0, color: T.txt },
+  ];
+
+  return (
+    <div className="fade-in"
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", backdropFilter: "blur(8px)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 500, padding: "16px" }}
+      onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()}
+        style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: "16px", width: "100%", maxWidth: "560px", maxHeight: "88vh", overflow: "hidden", display: "flex", flexDirection: "column", boxShadow: "0 24px 80px rgba(0,0,0,.6)" }}>
+
+        {/* Modal header */}
+        <div style={{ padding: "20px 24px 16px", borderBottom: `1px solid ${T.border}` }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "12px" }}>
+            {student.photoURL
+              ? <img src={student.photoURL} alt="" style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${T.border}` }} />
+              : <div style={{ width: 44, height: 44, borderRadius: "50%", background: `${color}20`, border: `2px solid ${color}40`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "16px", fontWeight: 700, color, flexShrink: 0 }}>
+                  {(student.displayName || "?")[0].toUpperCase()}
+                </div>
+            }
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <p style={{ fontSize: "16px", fontWeight: 700, color: T.txt }}>{student.displayName || "Isimsiz"}</p>
+              <p style={{ fontSize: "12px", color: T.sub, marginTop: "2px" }}>
+                {student.email} · Son giris: {fmtTs(student.lastSeen)}
+              </p>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <span style={{ fontSize: "12px", fontWeight: 600, padding: "5px 12px", borderRadius: "20px", background: `${color}15`, color, border: `1px solid ${color}30` }}>
+                {risk.level === "high" ? "Riskli" : risk.level === "mid" ? "Dikkat" : "Iyi"}
+              </span>
+              <button onClick={onClose} style={{ color: T.muted, fontSize: "22px", width: 32, height: 32, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: "6px", transition: "background .1s" }}
+                onMouseOver={(e) => e.currentTarget.style.background = T.border}
+                onMouseOut={(e)  => e.currentTarget.style.background = "none"}>
+                ×
+              </button>
+            </div>
+          </div>
+
+          {/* Stats row */}
+          <div style={{ display: "grid", gridTemplateColumns: `repeat(${stats.length}, 1fr)`, gap: "8px", marginBottom: "14px" }}>
+            {stats.map((s) => (
+              <div key={s.label} style={{ padding: "10px", background: "#0E0E16", borderRadius: "10px", border: `1px solid ${T.border}` }}>
+                <p style={{ fontSize: "18px", fontWeight: 700, color: s.color, lineHeight: 1 }}>{s.value}</p>
+                <p style={{ fontSize: "11px", color: T.muted, marginTop: "4px" }}>{s.label}</p>
+              </div>
+            ))}
+          </div>
+
+          {/* Plan adherence bar */}
+          <div style={{ marginBottom: "4px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "5px" }}>
+              <span style={{ fontSize: "12px", color: T.muted, textTransform: "uppercase", letterSpacing: ".06em", fontWeight: 600 }}>Plan Uyumu (7g)</span>
+              <span style={{ fontSize: "12px", fontWeight: 600, color: adherColor(risk.adherenceRate) }}>%{risk.adherenceRate}</span>
+            </div>
+            <PBar value={risk.adherenceRate} max={100} color={adherColor(risk.adherenceRate)} h={5} />
+          </div>
+
+          {/* Tab bar */}
+          <div style={{ display: "flex", gap: "4px", marginTop: "14px" }}>
+            {TABS.map((t) => (
+              <button key={t.key} onClick={() => setTab(t.key)}
+                style={{
+                  padding: "6px 14px", borderRadius: "8px", fontSize: "12px", fontWeight: 500,
+                  background: tab === t.key ? `${T.acc}20` : "transparent",
+                  color:      tab === t.key ? T.acc : T.sub,
+                  border: `1px solid ${tab === t.key ? `${T.acc}40` : "transparent"}`,
+                  transition: "all .12s",
+                }}>
+                {t.label}
+              </button>
+            ))}
+          </div>
         </div>
 
-        {/* Last trial */}
-        {student.lastTrialDate && (
-          <div style={{ padding:"9px 11px", background:"var(--s2)", borderRadius:"7px", border:"1px solid var(--b2)", marginBottom:"14px", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-            <div>
-              <Label style={{ marginBottom:"2px" }}>Son Deneme</Label>
-              <p style={{ fontSize:"12px" }}>{fmtDate(student.lastTrialDate)}</p>
-            </div>
-            <div style={{ textAlign:"right" }}>
-              <p style={{ fontFamily:"var(--mono)", fontSize:"20px", fontWeight:"700", color:"var(--acc)" }}>{student.lastTrialNet || 0}</p>
-              <p style={{ fontSize:"9px", color:"var(--muted)" }}>net</p>
-            </div>
-          </div>
-        )}
+        {/* Scrollable body */}
+        <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px" }}>
 
-        {/* Last seen */}
-        <div style={{ padding:"7px 10px", background:"var(--s2)", borderRadius:"7px", marginBottom:"14px", display:"flex", justifyContent:"space-between" }}>
-          <span style={{ fontFamily:"var(--mono)", fontSize:"10px", color:"var(--muted)" }}>Son giris</span>
-          <span style={{ fontFamily:"var(--mono)", fontSize:"10px", color:"var(--txt)" }}>{fmtTs(student.lastSeen)}</span>
-        </div>
-
-        {/* Part 4: stale sync warning */}
-        {isSyncStale(student) && (
-          <div style={{ padding:"8px 10px", background:"var(--muted)08", border:"1px solid var(--muted)22", borderRadius:"7px", marginBottom:"14px" }}>
-            <p style={{ fontFamily:"var(--mono)", fontSize:"10px", color:"var(--muted)" }}>
-              Veriler guncel olmayabilir. Ogrenci uygulamaya giris yapip calisma kaydettiginde risk ve plan bilgileri guncellenir.
-            </p>
-          </div>
-        )}
-
-        {/* Risk flags with explanations */}
-        {risk.flags.length > 0 && (
-          <div style={{ marginBottom:"16px" }}>
-            <Label style={{ marginBottom:"8px" }}>Risk Detayi</Label>
-            <div style={{ display:"flex", flexDirection:"column", gap:"5px" }}>
-              {risk.flags.map((f) => {
-                const meta = FLAG_META[f] || { label:f, color:"var(--muted)", desc:"" };
-                return (
-                  <div key={f} style={{ padding:"8px 10px", background:`${meta.color}08`, borderRadius:"6px", border:`1px solid ${meta.color}22`, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-                    <div>
-                      <p style={{ fontFamily:"var(--mono)", fontSize:"10px", color:meta.color, fontWeight:"600" }}>{meta.label}</p>
-                      <p style={{ fontSize:"11px", color:"var(--muted)", marginTop:"2px" }}>{meta.desc}</p>
-                    </div>
-                    <span style={{ fontFamily:"var(--mono)", fontSize:"9px", color:meta.color, background:`${meta.color}18`, padding:"2px 7px", borderRadius:"4px", flexShrink:0 }}>+{RISK_WEIGHTS[f] || 0}</span>
+          {tab === "overview" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+              {/* Last trial */}
+              {student.lastTrialDate ? (
+                <div style={{ padding: "14px 16px", background: "#0E0E16", border: `1px solid ${T.border}`, borderRadius: "10px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div>
+                    <p style={{ fontSize: "11px", color: T.muted, textTransform: "uppercase", letterSpacing: ".06em", fontWeight: 600, marginBottom: "4px" }}>Son Deneme</p>
+                    <p style={{ fontSize: "13px", color: T.sub }}>{fmtDate(student.lastTrialDate)}</p>
                   </div>
-                );
-              })}
+                  <p style={{ fontSize: "28px", fontWeight: 700, color: T.acc }}>{student.lastTrialNet ?? "--"}<span style={{ fontSize: "14px", color: T.sub, fontWeight: 400 }}> net</span></p>
+                </div>
+              ) : (
+                <div style={{ padding: "14px 16px", background: "#0E0E16", border: `1px solid ${T.border}`, borderRadius: "10px", textAlign: "center" }}>
+                  <p style={{ fontSize: "13px", color: T.muted }}>Henuz deneme kaydedilmemis.</p>
+                </div>
+              )}
+
+              {/* Risk flags */}
+              {risk.flags.length > 0 && (
+                <div>
+                  <p style={{ fontSize: "11px", color: T.muted, textTransform: "uppercase", letterSpacing: ".06em", fontWeight: 600, marginBottom: "8px" }}>Risk Detayi</p>
+                  <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                    {risk.flags.map((f) => {
+                      const meta = FLAG_META[f] || { label: f, desc: "" };
+                      const fc   = f === "plan_rate_low" || f === "no_checkin_3d" ? T.high
+                                 : f === "no_trial_7d"   || f === "no_login_2d"  ? T.mid : T.muted;
+                      return (
+                        <div key={f} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", background: `${fc}08`, border: `1px solid ${fc}25`, borderRadius: "9px" }}>
+                          <div>
+                            <p style={{ fontSize: "12px", fontWeight: 600, color: fc, marginBottom: "2px" }}>{meta.label}</p>
+                            <p style={{ fontSize: "11px", color: T.sub }}>{meta.desc}</p>
+                          </div>
+                          <span style={{ fontSize: "12px", fontWeight: 700, color: fc }}>+{RISK_WEIGHTS[f] ?? 0}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Stale warning */}
+              {stale && (
+                <div style={{ padding: "10px 14px", background: `${T.muted}10`, border: `1px solid ${T.muted}25`, borderRadius: "9px" }}>
+                  <p style={{ fontSize: "12px", color: T.muted }}>Veriler guncel olmayabilir. Ogrenci uygulamaya giris yapinca bilgiler guncellenir.</p>
+                </div>
+              )}
             </div>
-          </div>
-        )}
+          )}
 
-        {/* Weekly plan breakdown */}
-        <div style={{ borderTop:"1px solid var(--b1)", paddingTop:"14px", marginBottom:"4px" }}>
-          <WeeklyPlanBreakdown studentUid={student.uid} />
-        </div>
+          {tab === "goals" && (
+            <CounselorWeeklyGoals
+              studentUid={student.uid}
+              counselorUid={counselorUid}
+              studentSummary={student}
+            />
+          )}
 
-        {/* Counselor notes */}
-        <div style={{ borderTop:"1px solid var(--b1)", paddingTop:"14px" }}>
-          <CounselorNotes studentUid={student.uid} counselorUid={counselorUid} />
+          {tab === "plan" && <WeeklyPlanBreakdown studentUid={student.uid} />}
+
+          {tab === "notes" && <CounselorNotes studentUid={student.uid} counselorUid={counselorUid} />}
         </div>
       </div>
     </div>
@@ -559,10 +868,11 @@ function StudentDetailModal({ student, counselorUid, onClose }) {
 // Main CounselorDashboard
 // ============================================================================
 export default function CounselorDashboard({ profile, user, onSignOut, onSwitchToStudent, onOpenAssign }) {
-  const [students,  setStudents]  = useState([]);
-  const [loading,   setLoading]   = useState(true);
-  const [selected,  setSelected]  = useState(null);
-  const [filter,    setFilter]    = useState("all"); // all | high | mid | low
+  const [students, setStudents] = useState([]);
+  const [loading,  setLoading]  = useState(true);
+  const [selected, setSelected] = useState(null);
+  const [filter,   setFilter]   = useState("all");
+  const [search,   setSearch]   = useState("");
 
   const institutionId = profile?.institutionId;
   const groupId       = profile?.groupId;
@@ -574,10 +884,7 @@ export default function CounselorDashboard({ profile, user, onSignOut, onSwitchT
       .then((data) => { setStudents(data); setLoading(false); });
   }, [institutionId, groupId, role]);
 
-  const withRisk = useMemo(() =>
-    students.map((s) => ({ ...s, _risk: computeRisk(s) })),
-    [students]
-  );
+  const withRisk = useMemo(() => students.map((s) => ({ ...s, _risk: computeRisk(s) })), [students]);
 
   const counts = useMemo(() => ({
     high: withRisk.filter((s) => s._risk.level === "high").length,
@@ -586,94 +893,179 @@ export default function CounselorDashboard({ profile, user, onSignOut, onSwitchT
   }), [withRisk]);
 
   const sorted = useMemo(() => {
-    const list = filter === "all" ? withRisk : withRisk.filter((s) => s._risk.level === filter);
-    return [...list].sort((a, b) => {
-      if (b._risk.score !== a._risk.score) return b._risk.score - a._risk.score;
-      return a._risk.adherenceRate - b._risk.adherenceRate;
-    });
-  }, [withRisk, filter]);
+    let list = filter === "all" ? withRisk : withRisk.filter((s) => s._risk.level === filter);
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      list = list.filter((s) =>
+        (s.displayName || "").toLowerCase().includes(q) ||
+        (s.email       || "").toLowerCase().includes(q)
+      );
+    }
+    return [...list].sort((a, b) =>
+      b._risk.score !== a._risk.score
+        ? b._risk.score - a._risk.score
+        : a._risk.adherenceRate - b._risk.adherenceRate
+    );
+  }, [withRisk, filter, search]);
+
+  const roleLabel = role === "institution_admin" ? "Kurum Yoneticisi"
+                  : role === "super_admin"        ? "Super Admin"
+                  : "Rehberlikci";
+
+  const today = new Date().toLocaleDateString("tr-TR", { weekday: "long", day: "numeric", month: "long" });
 
   return (
-    <div style={{ minHeight:"100vh", background:"var(--bg)", fontFamily:"var(--sans)", display:"flex", justifyContent:"center", padding:"24px 12px 80px" }}>
+    <div style={{ minHeight: "100vh", background: T.bg, fontFamily: T.sans, color: T.txt }}>
       <style>{CSS}</style>
-      <div style={{ width:"100%", maxWidth:"600px" }}>
 
-        {/* Header */}
-        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:"20px" }}>
-          <div>
-            <p style={{ fontFamily:"var(--mono)", fontSize:"10px", color:"var(--muted)", letterSpacing:"2px", marginBottom:"4px" }}>
-              {role === "institution_admin" ? "KURUM YONETICISI" : role === "super_admin" ? "SUPER ADMIN" : "REHBERLIKCI"}
-            </p>
-            <h1 style={{ fontFamily:"var(--mono)", fontSize:"18px", fontWeight:"700", color:"var(--acc)" }}>Ogrenci Paneli</h1>
-            {user?.displayName && <p style={{ fontSize:"11px", color:"var(--muted)", marginTop:"3px" }}>{user.displayName}</p>}
+      {/* Top nav */}
+      <div style={{ borderBottom: `1px solid ${T.border}`, padding: "0 32px" }}>
+        <div style={{ maxWidth: "900px", margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between", height: "56px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+            <div style={{ width: 8, height: 8, borderRadius: "50%", background: T.acc }} />
+            <span style={{ fontSize: "14px", fontWeight: 700, color: T.txt, letterSpacing: "-.01em" }}>YKS Savas Odasi</span>
+            <span style={{ fontSize: "12px", color: T.muted }}>/ {roleLabel}</span>
           </div>
-          <div style={{ display:"flex", gap:"5px", flexDirection:"column", alignItems:"flex-end" }}>
-            <button onClick={onSignOut} style={{ fontFamily:"var(--mono)", fontSize:"9px", color:"var(--muted)", background:"none", border:"1px solid var(--b2)", borderRadius:"5px", padding:"5px 10px", cursor:"pointer" }}>Cikis</button>
-            {onSwitchToStudent && (
-              <button onClick={onSwitchToStudent} style={{ fontFamily:"var(--mono)", fontSize:"9px", color:"var(--acc)", background:"var(--acc)10", border:"1px solid var(--acc)33", borderRadius:"5px", padding:"5px 10px", cursor:"pointer" }}>Ogrenci Modu</button>
-            )}
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
             {onOpenAssign && (
-              <button onClick={onOpenAssign} style={{ fontFamily:"var(--mono)", fontSize:"9px", color:"var(--pur)", background:"var(--pur)10", border:"1px solid var(--pur)33", borderRadius:"5px", padding:"5px 10px", cursor:"pointer" }}>Kullanici Atama</button>
+              <Btn variant="ghost" onClick={onOpenAssign} style={{ fontSize: "12px", padding: "6px 12px" }}>
+                Kullanici Atama
+              </Btn>
             )}
+            {onSwitchToStudent && (
+              <Btn variant="ghost" onClick={onSwitchToStudent} style={{ fontSize: "12px", padding: "6px 12px" }}>
+                Ogrenci Modu
+              </Btn>
+            )}
+            <Btn variant="ghost" onClick={onSignOut} style={{ fontSize: "12px", padding: "6px 12px" }}>
+              Cikis
+            </Btn>
+          </div>
+        </div>
+      </div>
+
+      {/* Page content */}
+      <div style={{ maxWidth: "900px", margin: "0 auto", padding: "32px 32px 80px" }}>
+
+        {/* Page header */}
+        <div style={{ marginBottom: "28px" }}>
+          <p style={{ fontSize: "12px", color: T.muted, marginBottom: "4px" }}>{today}</p>
+          <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between" }}>
+            <div>
+              <h1 style={{ fontSize: "24px", fontWeight: 700, color: T.txt, letterSpacing: "-.02em" }}>
+                Ogrenci Paneli
+              </h1>
+              {user?.displayName && (
+                <p style={{ fontSize: "13px", color: T.sub, marginTop: "4px" }}>{user.displayName}</p>
+              )}
+            </div>
+            <p style={{ fontSize: "13px", color: T.muted }}>
+              {students.length} ogrenci
+            </p>
           </div>
         </div>
 
         {/* No institution */}
         {!institutionId && !loading && (
-          <div style={{ textAlign:"center", padding:"60px 20px" }}>
-            <p style={{ fontFamily:"var(--mono)", fontSize:"24px", color:"var(--b2)", marginBottom:"12px" }}>◈</p>
-            <p style={{ fontSize:"13px", color:"var(--muted)", marginBottom:"6px" }}>Kuruma atanmamissiniz</p>
-            <p style={{ fontSize:"11px", color:"var(--b2)", lineHeight:"1.6", maxWidth:"220px", margin:"0 auto" }}>Kurum yoneticisinden kuruma eklemenizi isteyin.</p>
+          <div style={{ textAlign: "center", padding: "80px 20px" }}>
+            <div style={{ fontSize: "40px", marginBottom: "16px" }}>◈</div>
+            <p style={{ fontSize: "16px", fontWeight: 600, color: T.txt, marginBottom: "8px" }}>Kuruma atanmamissiniz</p>
+            <p style={{ fontSize: "13px", color: T.muted, maxWidth: "260px", margin: "0 auto", lineHeight: 1.6 }}>Kurum yoneticisinden kuruma eklemenizi isteyin.</p>
           </div>
         )}
 
         {loading && (
-          <p style={{ fontFamily:"var(--mono)", fontSize:"11px", color:"var(--muted)", textAlign:"center", padding:"40px", animation:"blink 1.5s ease infinite" }}>Yukleniyor...</p>
+          <div style={{ display: "flex", justifyContent: "center", padding: "80px" }}>
+            <Spinner />
+          </div>
         )}
 
         {!loading && institutionId && (
           <>
-            {/* Risk summary bar */}
-            <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:"7px", marginBottom:"16px" }}>
+            {/* Summary cards */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: "12px", marginBottom: "28px" }}>
               {[
-                { key:"high", label:"Riskli", color:"var(--red)" },
-                { key:"mid",  label:"Dikkat", color:"var(--ora)" },
-                { key:"low",  label:"Iyi",    color:"var(--grn)" },
+                { key: "high", label: "Riskli", color: T.high },
+                { key: "mid",  label: "Dikkat", color: T.mid  },
+                { key: "low",  label: "Iyi",    color: T.low  },
               ].map((x) => (
-                <button key={x.key} onClick={() => setFilter(filter === x.key ? "all" : x.key)}
-                  style={{ padding:"10px 8px", borderRadius:"8px", textAlign:"center", cursor:"pointer", background: filter === x.key ? `${x.color}18` : "var(--s1)", border:`1px solid ${filter === x.key ? x.color : "var(--b1)"}`, transition:"all .15s" }}>
-                  <p style={{ fontFamily:"var(--mono)", fontSize:"20px", fontWeight:"700", color:x.color, lineHeight:1 }}>{counts[x.key]}</p>
-                  <p style={{ fontSize:"9px", color:"var(--muted)", marginTop:"3px" }}>{x.label}</p>
+                <button key={x.key}
+                  onClick={() => setFilter(filter === x.key ? "all" : x.key)}
+                  style={{
+                    padding: "20px",
+                    background: filter === x.key ? `${x.color}12` : T.card,
+                    border: `1px solid ${filter === x.key ? `${x.color}40` : T.border}`,
+                    borderRadius: "12px",
+                    textAlign: "left",
+                    transition: "all .15s",
+                    cursor: "pointer",
+                  }}>
+                  <p style={{ fontSize: "32px", fontWeight: 800, color: x.color, lineHeight: 1, marginBottom: "6px" }}>
+                    {counts[x.key]}
+                  </p>
+                  <p style={{ fontSize: "13px", color: T.sub, fontWeight: 500 }}>{x.label}</p>
                 </button>
               ))}
             </div>
 
-            {/* List header */}
-            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:"10px" }}>
-              <Label>
-                {filter === "all" ? `Tum ogrenciler (${students.length})` : `${RISK_LABEL[filter]} (${counts[filter]})`}
-              </Label>
-              {filter !== "all" && (
-                <button onClick={() => setFilter("all")} style={{ fontFamily:"var(--mono)", fontSize:"9px", color:"var(--muted)", background:"none", border:"none", cursor:"pointer" }}>
-                  Tumunu goster
+            {/* Filter + search bar */}
+            <div style={{ display: "flex", gap: "10px", alignItems: "center", marginBottom: "20px", flexWrap: "wrap" }}>
+              <div style={{ display: "flex", gap: "4px", background: T.card, border: `1px solid ${T.border}`, borderRadius: "10px", padding: "4px" }}>
+                {["all", "high", "mid", "low"].map((f) => {
+                  const labels = { all: "Tumü", high: "Riskli", mid: "Dikkat", low: "Iyi" };
+                  return (
+                    <button key={f} onClick={() => setFilter(f)}
+                      style={{
+                        padding: "6px 14px", borderRadius: "7px", fontSize: "12px", fontWeight: 500,
+                        background: filter === f ? `${T.acc}20` : "transparent",
+                        color:      filter === f ? T.acc : T.sub,
+                        border:     `1px solid ${filter === f ? `${T.acc}40` : "transparent"}`,
+                        transition: "all .12s",
+                        cursor: "pointer",
+                      }}>
+                      {labels[f]}
+                    </button>
+                  );
+                })}
+              </div>
+              <div style={{ flex: 1, minWidth: "180px", position: "relative" }}>
+                <span style={{ position: "absolute", left: "12px", top: "50%", transform: "translateY(-50%)", color: T.muted, fontSize: "14px", pointerEvents: "none" }}>⌕</span>
+                <input
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Ogrenci ara..."
+                  style={{ width: "100%", padding: "8px 12px 8px 34px", borderRadius: "9px", fontSize: "13px" }}
+                />
+              </div>
+              {(filter !== "all" || search) && (
+                <button onClick={() => { setFilter("all"); setSearch(""); }}
+                  style={{ fontSize: "12px", color: T.muted, textDecoration: "underline", cursor: "pointer" }}>
+                  Temizle
                 </button>
               )}
             </div>
 
+            {/* List label */}
+            <p style={{ fontSize: "12px", color: T.muted, marginBottom: "12px", textTransform: "uppercase", letterSpacing: ".06em", fontWeight: 600 }}>
+              {sorted.length} ogrenci
+              {filter !== "all" && ` · ${filter === "high" ? "Riskli" : filter === "mid" ? "Dikkat" : "Iyi"} filtresi`}
+              {search && ` · "${search}"`}
+            </p>
+
             {/* Empty */}
             {sorted.length === 0 && (
-              <div style={{ textAlign:"center", padding:"50px 20px" }}>
-                <p style={{ fontFamily:"var(--mono)", fontSize:"22px", color:"var(--b2)", marginBottom:"10px" }}>◻</p>
-                <p style={{ fontSize:"12px", color:"var(--muted)" }}>
+              <div style={{ textAlign: "center", padding: "60px 20px" }}>
+                <p style={{ fontSize: "32px", marginBottom: "12px" }}>◻</p>
+                <p style={{ fontSize: "14px", color: T.muted }}>
                   {students.length === 0
-                    ? "Henuz ogrenci yok. Ogrencilerin kuruma katilmasi gerekiyor."
-                    : "Bu filtrede ogrenci yok."}
+                    ? "Henuz ogrenci yok."
+                    : "Bu filtrede ogrenci bulunamadi."}
                 </p>
               </div>
             )}
 
-            {/* Student cards */}
-            <div style={{ display:"flex", flexDirection:"column", gap:"8px" }}>
+            {/* Student list */}
+            <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
               {sorted.map((s) => (
                 <StudentCard key={s.uid} student={s} onClick={() => setSelected(s)} />
               ))}
@@ -682,7 +1074,7 @@ export default function CounselorDashboard({ profile, user, onSignOut, onSwitchT
         )}
       </div>
 
-      {/* Student detail modal */}
+      {/* Modal */}
       {selected && (
         <StudentDetailModal
           student={selected}
