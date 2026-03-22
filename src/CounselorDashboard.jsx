@@ -38,8 +38,18 @@ const fmtDate = (iso) => {
   return new Date(iso).toLocaleDateString("tr-TR", { day: "2-digit", month: "short" });
 };
 
+// Part 4: check if student's cloud data may be stale
+// syncedAt is written by scheduleSummary -- if missing or old, warn counselor
+function isSyncStale(student) {
+  if (!student.syncedAt) return true; // never synced
+  const syncedMs = student.syncedAt?.seconds
+    ? student.syncedAt.seconds * 1000
+    : new Date(student.syncedAt).getTime();
+  return (Date.now() - syncedMs) > 3 * 86400000; // stale if > 3 days
+}
+
 // Compute risk from summary fields
-// FIX 11: only use reliable minute-based adherenceRate, no task-count fallback
+// FIX 11/14: only use reliable minute-based adherenceRate, no task-count fallback
 function computeRisk(student) {
   const storedFlags = student.riskFlags || [];
 
@@ -200,6 +210,14 @@ function StudentCard({ student, onClick }) {
       {risk.flags.length > 0 && (
         <div style={{ display:"flex", gap:"4px", flexWrap:"wrap", marginTop:"7px" }}>
           {risk.flags.map((f) => <FlagChip key={f} flag={f} />)}
+        </div>
+      )}
+      {/* Part 4: stale data warning */}
+      {isSyncStale(student) && (
+        <div style={{ marginTop:"6px", padding:"3px 7px", background:"var(--muted)10", border:"1px solid var(--muted)22", borderRadius:"4px" }}>
+          <span style={{ fontFamily:"var(--mono)", fontSize:"8px", color:"var(--muted)" }}>
+            veri guncel olmayabilir -- ogrenci son {Math.floor((Date.now() - (student.syncedAt?.seconds ? student.syncedAt.seconds*1000 : 0)) / 86400000)}g sync yapmadi
+          </span>
         </div>
       )}
     </div>
@@ -492,6 +510,15 @@ function StudentDetailModal({ student, counselorUid, onClose }) {
           <span style={{ fontFamily:"var(--mono)", fontSize:"10px", color:"var(--muted)" }}>Son giris</span>
           <span style={{ fontFamily:"var(--mono)", fontSize:"10px", color:"var(--txt)" }}>{fmtTs(student.lastSeen)}</span>
         </div>
+
+        {/* Part 4: stale sync warning */}
+        {isSyncStale(student) && (
+          <div style={{ padding:"8px 10px", background:"var(--muted)08", border:"1px solid var(--muted)22", borderRadius:"7px", marginBottom:"14px" }}>
+            <p style={{ fontFamily:"var(--mono)", fontSize:"10px", color:"var(--muted)" }}>
+              Veriler guncel olmayabilir. Ogrenci uygulamaya giris yapip calisma kaydettiginde risk ve plan bilgileri guncellenir.
+            </p>
+          </div>
+        )}
 
         {/* Risk flags with explanations */}
         {risk.flags.length > 0 && (

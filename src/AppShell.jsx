@@ -3,6 +3,7 @@ import {
   onUser, signInGoogle, signOutUser, fsLoadAll, fsSave, checkRedirect,
   checkIsAdmin, writeProfile, scheduleSummary, logActivity,
   adminGetUsers, adminGetUserData, getUserProfile,
+  checkSyncStatus, forceSummarySync,
 } from "./firebase.js";
 import CounselorDashboard  from "./CounselorDashboard.jsx";
 import AdminAssignPanel    from "./pages/AdminAssignPanel.jsx";
@@ -58,11 +59,17 @@ function _writeSummary(uid, user) {
     );
 
     // Plan adherence -- minute-based, last 7 days
+    // FIX 10: paused blocks contribute pausedAt minutes to completedMin
     let totalTarget = 0, totalCompleted = 0;
     last7.forEach((d) => {
       (plans[d] || []).forEach((x) => {
-        totalTarget    += x.durationMin || 0;
-        if (x.done) totalCompleted += x.actualMin || x.durationMin || 0;
+        totalTarget += x.durationMin || 0;
+        if (x.done) {
+          totalCompleted += x.actualMin || x.durationMin || 0;
+        } else if (x.pausedAt && x.pausedAt > 0) {
+          // FIX 10: paused-but-not-finished work still counts toward completion
+          totalCompleted += x.pausedAt;
+        }
       });
     });
     const adherenceRate = totalTarget > 0
@@ -1192,8 +1199,9 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
       return;
     }
 
-    // Gecerli study session ise konu sorusu sor
-    if (valid && item.kind === "study") {
+    // FIX 11: only open session close modal for full, clean completions (not early/paused finishes)
+    const isCleanFinish = valid && !early && item.kind === "study";
+    if (isCleanFinish) {
       setSessionCloseItem({ id, subject: item.subject, actualMin });
       stopTimer();
       return;
@@ -2756,7 +2764,9 @@ export default function App() {
   const [profile, setProfile]     = useState(null);
   const [profileLoading, setProfileLoading]   = useState(true);
   const [forceStudent, setForceStudent]       = useState(false);
-  const [showAssignPanel, setShowAssignPanel] = useState(false); // Phase 2 admin assignment
+  const [showAssignPanel, setShowAssignPanel] = useState(false);
+  // Part 4: sync status tracking
+  const [syncPending, setSyncPending] = useState(false);
 
   // Admin check -- uid degisince calis
   useEffect(() => {
@@ -2823,8 +2833,24 @@ export default function App() {
             setTodos(store.load(KEYS.todos, []));
             setXp(loadXP());
           }
-          // Write initial summary after sync
+          // Write full summary after sync
           _writeSummary(fbUser.uid, fbUser);
+
+          // Part 4: check if local data is newer than cloud -- force sync if so
+          const syncStatus = await checkSyncStatus(fbUser.uid);
+          if (syncStatus.stale) {
+            console.log("[sync] Local data is newer than cloud -- force syncing...");
+            setSyncPending(true);
+            // Re-write all local keys to Firestore
+            const SYNC_KEYS = ["yks_xp","yks_plan","yks_trials","yks_todos","yks_checkins","yks_dw","yks_attn"];
+            SYNC_KEYS.forEach((k) => {
+              const v = store.load(k, null);
+              if (v !== null) fsSave(fbUser.uid, k, v);
+            });
+            // Force summary with fresh data
+            _writeSummary(fbUser.uid, fbUser);
+            setTimeout(() => setSyncPending(false), 4000);
+          }
         } catch { /* offline -- keep localStorage */ }
         setSyncing(false);
       } else {
@@ -2858,8 +2884,10 @@ export default function App() {
     setTodos((prev) => { const next = [...mapped, ...prev]; store.save(KEYS.todos, next); return next; });
   }, []);
 
-  const checkins = useMemo(() => store.load(KEYS.checkins, []), [tab]);
-  const plans    = useMemo(() => store.load(KEYS.plan, {}),    [tab]);
+  // FIX 12: include trials and todos in deps so memos re-read when data changes
+  // tab change also triggers re-read (existing behavior preserved)
+  const checkins = useMemo(() => store.load(KEYS.checkins, []), [tab, trials, todos]);
+  const plans    = useMemo(() => store.load(KEYS.plan, {}),    [tab, trials, todos]);
 
   const alerts = useMemo(() => {
     const today       = todayStr();
@@ -2956,7 +2984,7 @@ export default function App() {
         )}
         <AuthBanner
           user={user}
-          syncing={syncing}
+          syncing={syncing || syncPending}
           isAdmin={isAdmin}
           onSignIn={() => signInGoogle()}
           onSignOut={() => { signOutUser(); _syncUid = null; _syncUser = null; }}

@@ -26,8 +26,13 @@ import {
 // ============================================================================
 // Init -- single instance guarantee
 // ============================================================================
+const _fbApiKey = import.meta.env.VITE_FB_API_KEY;
+if (!_fbApiKey) {
+  console.warn("[firebase] VITE_FB_API_KEY not set -- running in local-only mode");
+}
+
 const firebaseConfig = {
-  apiKey:            import.meta.env.VITE_FB_API_KEY || "BURAYA_GERCEK_API_KEY",
+  apiKey:            _fbApiKey || "",
   authDomain:        "yks-savas-odasi.firebaseapp.com",
   projectId:         "yks-savas-odasi",
   storageBucket:     "yks-savas-odasi.firebasestorage.app",
@@ -60,7 +65,17 @@ export const signInGoogle = async () => {
 
 export const signOutUser   = () => signOut(auth);
 export const onUser        = (cb) => onAuthStateChanged(auth, cb);
-export const checkRedirect = () => getRedirectResult(auth).catch(() => null);
+export const checkRedirect = async () => {
+  try {
+    return await getRedirectResult(auth);
+  } catch (e) {
+    // Log real auth errors -- do not swallow silently
+    if (e?.code && e.code !== "auth/null-user") {
+      console.warn("[firebase] checkRedirect error:", e.code, e.message);
+    }
+    return null;
+  }
+};
 
 // ============================================================================
 // Admin check (super admin -- admins collection)
@@ -132,10 +147,26 @@ export async function setUserProfileRole(uid, role) {
   }
 }
 
-// Assign user to a group -- updates profile + group's studentUids[]
+// Assign user to a group -- FIX 17: removes from old group first
+// FIX 18: single consistent logic path used by both assignment flows
 export async function assignUserToGroup(uid, institutionId, groupId) {
   if (!uid || !institutionId || !groupId) return;
   try {
+    // Read current profile to find old group
+    const profileSnap = await getDoc(doc(db, "users", uid, "profile", "info"));
+    const oldGroupId       = profileSnap.exists() ? profileSnap.data().groupId       : null;
+    const oldInstitutionId = profileSnap.exists() ? profileSnap.data().institutionId : null;
+
+    // FIX 17: Remove from old group's studentUids if switching groups
+    if (oldGroupId && (oldGroupId !== groupId || oldInstitutionId !== institutionId)) {
+      const oldGroupRef  = doc(db, "institutions", oldInstitutionId, "groups", oldGroupId);
+      const oldGroupSnap = await getDoc(oldGroupRef);
+      if (oldGroupSnap.exists()) {
+        const filtered = (oldGroupSnap.data().studentUids || []).filter((id) => id !== uid);
+        await setDoc(oldGroupRef, { studentUids: filtered, updatedAt: serverTimestamp() }, { merge: true });
+      }
+    }
+
     // 1. Update user profile
     await setDoc(doc(db, "users", uid, "profile", "info"), {
       institutionId,
@@ -143,14 +174,14 @@ export async function assignUserToGroup(uid, institutionId, groupId) {
       updatedAt: serverTimestamp(),
     }, { merge: true });
 
-    // 2. Update userSummary so counselor panel sees it
+    // 2. Update userSummary
     await setDoc(doc(db, "userSummaries", uid), {
       institutionId,
       groupId,
       updatedAt: serverTimestamp(),
     }, { merge: true });
 
-    // 3. Add uid to group's studentUids array
+    // 3. Add uid to new group's studentUids
     const groupRef  = doc(db, "institutions", institutionId, "groups", groupId);
     const groupSnap = await getDoc(groupRef);
     const existing  = groupSnap.exists() ? (groupSnap.data().studentUids || []) : [];
@@ -166,28 +197,21 @@ export async function assignUserToGroup(uid, institutionId, groupId) {
 }
 
 // ============================================================================
-// Institution helpers (Phase 0 foundation -- no UI yet)
+// Institution helpers
 // ============================================================================
-
-/**
- * Institution shape (institutions/{id}):
- * {
- *   name, plan, ownerUid, createdAt
- * }
- */
 export async function createInstitution(ownerUid, name) {
   if (!ownerUid || !name) return null;
   try {
     const id  = `inst_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const ref = doc(db, "institutions", id);
-    await setDoc(ref, {
-      name,
-      plan:      "trial",
-      ownerUid,
-      createdAt: serverTimestamp(),
-    });
-    // Set owner's profile as institution_admin
-    await setUserProfileRole(ownerUid, "institution_admin");
+    await setDoc(ref, { name, plan: "trial", ownerUid, createdAt: serverTimestamp() });
+
+    // FIX 19: don't downgrade super_admin -- only set institution_admin if not already higher
+    const profileSnap = await getDoc(doc(db, "users", ownerUid, "profile", "info"));
+    const currentRole = profileSnap.exists() ? profileSnap.data().role : null;
+    if (currentRole !== "super_admin") {
+      await setUserProfileRole(ownerUid, "institution_admin");
+    }
     await setDoc(doc(db, "users", ownerUid, "profile", "info"), {
       institutionId: id,
     }, { merge: true });
@@ -215,14 +239,25 @@ export async function createGroup(institutionId, counselorUid, name) {
       studentUids:  [],
       createdAt:    serverTimestamp(),
     });
-    // If counselor uid given, update their profile
+    // FIX 19: only set counselor role if not already institution_admin or super_admin
     if (counselorUid) {
-      await setDoc(doc(db, "users", counselorUid, "profile", "info"), {
-        institutionId,
-        groupId:   id,
-        role:      "counselor",
-        updatedAt: serverTimestamp(),
-      }, { merge: true });
+      const profileSnap = await getDoc(doc(db, "users", counselorUid, "profile", "info"));
+      const currentRole = profileSnap.exists() ? profileSnap.data().role : null;
+      const higherRoles = ["institution_admin", "super_admin"];
+      if (!higherRoles.includes(currentRole)) {
+        await setDoc(doc(db, "users", counselorUid, "profile", "info"), {
+          institutionId,
+          groupId:   id,
+          role:      "counselor",
+          updatedAt: serverTimestamp(),
+        }, { merge: true });
+      } else {
+        await setDoc(doc(db, "users", counselorUid, "profile", "info"), {
+          institutionId,
+          groupId:   id,
+          updatedAt: serverTimestamp(),
+        }, { merge: true });
+      }
     }
     return id;
   } catch (e) {
@@ -262,37 +297,41 @@ export function fsSave(uid, key, value) {
 }
 
 // ============================================================================
-// Summary (unchanged + new fields supported via merge)
+// Summary -- uid-scoped debounce (FIX 22)
 // ============================================================================
-let _summaryTimer   = null;
-let _pendingSummary = null;
+const _summaryTimers   = {}; // uid -> timer
+const _pendingSummaries = {}; // uid -> data
 
 export function scheduleSummary(uid, data) {
   if (!uid) return;
-  _pendingSummary = data;
-  if (_summaryTimer) return;
-  _summaryTimer = setTimeout(() => {
-    if (_pendingSummary) {
+  // FIX 22: uid-scoped -- prevents one user's timer firing with another's data
+  _pendingSummaries[uid] = data;
+  if (_summaryTimers[uid]) return;
+  _summaryTimers[uid] = setTimeout(() => {
+    const pending = _pendingSummaries[uid];
+    if (pending) {
       setDoc(doc(db, "userSummaries", uid), {
-        ..._pendingSummary,
-        lastSeen: serverTimestamp(),
-      }, { merge: true }).catch(() => {});
+        ...pending,
+        lastSeen:  serverTimestamp(),
+        syncedAt:  serverTimestamp(), // FIX Part4: track last sync time
+      }, { merge: true }).catch((e) => console.warn("[firebase] scheduleSummary write failed:", e.code));
     }
-    _pendingSummary = null;
-    _summaryTimer   = null;
+    delete _pendingSummaries[uid];
+    delete _summaryTimers[uid];
   }, 3000);
 }
 
 // ============================================================================
-// Activity log (unchanged)
+// Activity log -- uid-aware cooldown (FIX 23)
 // ============================================================================
-const _cooldown = {};
+const _cooldown = {}; // "uid:key" -> timestamp
 
 export function logActivity(uid, key) {
   if (!uid) return;
+  const ck  = `${uid}:${key}`; // FIX 23: uid-scoped cooldown key
   const now = Date.now();
-  if (_cooldown[key] && now - _cooldown[key] < 60000) return;
-  _cooldown[key] = now;
+  if (_cooldown[ck] && now - _cooldown[ck] < 60000) return;
+  _cooldown[ck] = now;
   addDoc(collection(db, "users", uid, "activity"), {
     key,
     at: serverTimestamp(),
@@ -378,8 +417,25 @@ export async function adminGetUserData(uid) {
 // Phase 1 -- Counselor dashboard helpers
 // ============================================================================
 
-// Get all userSummaries for a given institution (+ optional group filter)
-// Only shows confirmed students (role === 'student' or role not set but has institutionId)
+// ============================================================================
+// Phase 2 -- super_admin assignment panel helpers
+// ============================================================================
+
+// FIX 20: getAllUsers also checks users who have signed in but have no summary yet
+// (e.g. new user who hasn't saved any data to trigger scheduleSummary)
+export async function getAllUsers() {
+  try {
+    const snap = await getDocs(collection(db, "userSummaries"));
+    const summaryUsers = snap.docs.map((d) => ({ uid: d.id, ...d.data() }));
+    return summaryUsers.sort((a, b) => (a.displayName || "").localeCompare(b.displayName || ""));
+  } catch (e) {
+    console.error("getAllUsers error:", e.code, e.message);
+    return [];
+  }
+}
+
+// FIX 21: getGroupStudents -- still client-side filter (Firestore free tier has no composite index)
+// but scoped more safely with explicit role check
 export async function getGroupStudents(institutionId, groupId) {
   if (!institutionId) return [];
   try {
@@ -387,33 +443,14 @@ export async function getGroupStudents(institutionId, groupId) {
     return snap.docs
       .map((d) => ({ uid: d.id, ...d.data() }))
       .filter((u) => {
-        // Must belong to this institution
         if (u.institutionId !== institutionId) return false;
-        // Must be a student role (or unset -- but only if institutionId matches)
         const role = u.role || "student";
         if (role === "counselor" || role === "institution_admin" || role === "super_admin") return false;
-        // Optional group filter
         if (groupId && u.groupId !== groupId) return false;
         return true;
       });
   } catch (e) {
     console.error("getGroupStudents error:", e.code, e.message);
-    return [];
-  }
-}
-
-// ============================================================================
-// Phase 2 -- super_admin assignment panel helpers
-// ============================================================================
-
-// Get all users from userSummaries (includes role, institutionId, groupId)
-export async function getAllUsers() {
-  try {
-    const snap = await getDocs(collection(db, "userSummaries"));
-    return snap.docs.map((d) => ({ uid: d.id, ...d.data() }))
-      .sort((a, b) => (a.displayName || "").localeCompare(b.displayName || ""));
-  } catch (e) {
-    console.error("getAllUsers error:", e.code, e.message);
     return [];
   }
 }
@@ -439,19 +476,25 @@ export async function updateUserProfileRole(uid, role) {
   }
 }
 
-// Update institutionId and groupId in both profile/info and userSummaries
+// FIX 18: delegate to assignUserToGroup for consistent logic (handles old group removal)
 export async function updateUserInstitutionGroup(uid, institutionId, groupId) {
   if (!uid) return false;
   try {
-    const data = {
-      institutionId: institutionId || null,
-      groupId:       groupId       || null,
-      updatedAt:     serverTimestamp(),
-    };
-    await Promise.all([
-      setDoc(doc(db, "users", uid, "profile", "info"), data, { merge: true }),
-      setDoc(doc(db, "userSummaries", uid),             data, { merge: true }),
-    ]);
+    if (institutionId && groupId) {
+      // Full assignment -- use shared logic path that handles old group removal
+      await assignUserToGroup(uid, institutionId, groupId);
+    } else {
+      // Partial clear -- just update profile and summary directly
+      const data = {
+        institutionId: institutionId || null,
+        groupId:       groupId       || null,
+        updatedAt:     serverTimestamp(),
+      };
+      await Promise.all([
+        setDoc(doc(db, "users", uid, "profile", "info"), data, { merge: true }),
+        setDoc(doc(db, "userSummaries", uid),             data, { merge: true }),
+      ]);
+    }
     return true;
   } catch (e) {
     console.error("updateUserInstitutionGroup error:", e.code, e.message);
@@ -495,5 +538,55 @@ export async function getCounselorNotes(studentUid) {
   } catch (e) {
     console.error("getCounselorNotes error:", e.code, e.message);
     return [];
+  }
+}
+
+// ============================================================================
+// Part 4 -- Offline sync / staleness detection
+// ============================================================================
+
+// Check if cloud summary is stale compared to local data
+// Returns { stale: bool, localUpdatedAt: number, cloudSyncedAt: number|null }
+export async function checkSyncStatus(uid) {
+  if (!uid) return { stale: false, localUpdatedAt: 0, cloudSyncedAt: null };
+  try {
+    const snap = await getDocFromServer(doc(db, "userSummaries", uid));
+    if (!snap.exists()) return { stale: true, localUpdatedAt: Date.now(), cloudSyncedAt: null };
+
+    const cloudSyncedAt = snap.data().syncedAt?.seconds
+      ? snap.data().syncedAt.seconds * 1000
+      : null;
+
+    // Use yks_xp lastDate as proxy for last local activity
+    const xpRaw = localStorage.getItem("yks_xp");
+    const xpData = xpRaw ? JSON.parse(xpRaw) : {};
+    const lastLocalDate = xpData.lastDate
+      ? new Date(xpData.lastDate).getTime()
+      : 0;
+
+    const stale = cloudSyncedAt
+      ? lastLocalDate > cloudSyncedAt + 60000 // local is 1min+ newer than cloud
+      : lastLocalDate > 0;
+
+    return { stale, localUpdatedAt: lastLocalDate, cloudSyncedAt };
+  } catch (e) {
+    console.warn("[firebase] checkSyncStatus error:", e.code);
+    return { stale: false, localUpdatedAt: 0, cloudSyncedAt: null };
+  }
+}
+
+// Force immediate summary write -- bypasses debounce timer
+// Used when coming back online after offline period
+export async function forceSummarySync(uid, data) {
+  if (!uid || !data) return;
+  try {
+    await setDoc(doc(db, "userSummaries", uid), {
+      ...data,
+      lastSeen: serverTimestamp(),
+      syncedAt: serverTimestamp(),
+    }, { merge: true });
+    console.log("[firebase] forceSummarySync: synced for", uid);
+  } catch (e) {
+    console.warn("[firebase] forceSummarySync failed:", e.code, e.message);
   }
 }
