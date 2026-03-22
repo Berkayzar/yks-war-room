@@ -2,8 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   onUser, signInGoogle, signOutUser, fsLoadAll, fsSave, checkRedirect,
   checkIsAdmin, writeProfile, scheduleSummary, logActivity,
-  adminGetUsers, adminGetUserData,
+  adminGetUsers, adminGetUserData, getUserProfile,
 } from "./firebase.js";
+import CounselorDashboard  from "./CounselorDashboard.jsx";
+import AdminAssignPanel    from "./pages/AdminAssignPanel.jsx";
 
 // ============================================================================
 // Storage -- localStorage primary, Firestore sync when signed in
@@ -44,24 +46,119 @@ const store = {
 function _writeSummary(uid, user) {
   if (!uid || !user) return;
   try {
-    const xpData   = JSON.parse(localStorage.getItem("yks_xp")    || "{}");
-    const todos    = JSON.parse(localStorage.getItem("yks_todos")  || "[]");
-    const trials   = JSON.parse(localStorage.getItem("yks_trials") || "[]");
-    const checkins = JSON.parse(localStorage.getItem("yks_checkins") || "[]");
-    const plans    = JSON.parse(localStorage.getItem("yks_plan")   || "{}");
-    const planCount = Object.values(plans).flat().length;
+    const xpData   = JSON.parse(localStorage.getItem("yks_xp")       || "{}");
+    const todos    = JSON.parse(localStorage.getItem("yks_todos")     || "[]");
+    const trials   = JSON.parse(localStorage.getItem("yks_trials")    || "[]");
+    const checkins = JSON.parse(localStorage.getItem("yks_checkins")  || "[]");
+    const plans    = JSON.parse(localStorage.getItem("yks_plan")      || "{}");
+
+    const now  = Date.now();
+    const last7 = Array.from({ length: 7 }, (_, i) =>
+      new Date(now - i * 86400000).toISOString().slice(0, 10)
+    );
+
+    // Plan adherence -- minute-based, last 7 days
+    let totalTarget = 0, totalCompleted = 0;
+    last7.forEach((d) => {
+      (plans[d] || []).forEach((x) => {
+        totalTarget    += x.durationMin || 0;
+        if (x.done) totalCompleted += x.actualMin || x.durationMin || 0;
+      });
+    });
+    const adherenceRate = totalTarget > 0
+      ? Math.round((totalCompleted / totalTarget) * 100)
+      : 0;
+
+    // Todo type counts
+    const academicTodos = todos.filter((t) => t.todoType === "academic").length;
+    const trialTodos    = todos.filter((t) => t.todoType === "trial").length;
+    const doneTodos     = todos.filter((t) => t.done).length;
+
+    // Plan counts
+    const planItems     = Object.values(plans).flat();
+    const planCount     = planItems.length;
+    const planDoneCount = planItems.filter((x) => x.done).length;
+
+    // Last trial info
+    const sortedTrials = [...trials].sort((a, b) => new Date(b.date) - new Date(a.date));
+    const lastTrial    = sortedTrials[0] || null;
+    const lastTrialDate = lastTrial?.date || null;
+    const lastTrialNet  = lastTrial?.totalNet || 0;
+
+    // Last checkin date
+    const sortedCheckins = [...checkins].sort((a, b) => new Date(b.date) - new Date(a.date));
+    const lastCheckinDate = sortedCheckins[0]?.date || null;
+
+    // ----------------------------------------------------------------
+    // Risk Engine -- Phase 3
+    // ----------------------------------------------------------------
+    const RISK_WEIGHTS = {
+      no_checkin_3d: 30,
+      plan_rate_low: 25,
+      no_trial_7d:   20,
+      streak_broken: 15,
+      no_login_2d:   10,
+    };
+
+    const riskFlags = [];
+
+    // no_login_2d: lastSeen is not available in localStorage,
+    // so we use the current save as "just logged in" -- flag will be
+    // set by counselor dashboard from Firestore lastSeen field.
+    // We still calculate the rest here.
+
+    // no_checkin_3d
+    if (!lastCheckinDate || daysFromDate(lastCheckinDate) >= 3) {
+      riskFlags.push("no_checkin_3d");
+    }
+
+    // plan_rate_low
+    if (totalTarget > 0 && adherenceRate < 40) {
+      riskFlags.push("plan_rate_low");
+    }
+
+    // no_trial_7d
+    if (!lastTrialDate || daysFromDate(lastTrialDate) >= 7) {
+      riskFlags.push("no_trial_7d");
+    }
+
+    // streak_broken
+    if (!xpData.streak || xpData.streak === 0) {
+      riskFlags.push("streak_broken");
+    }
+
+    const riskScore = riskFlags.reduce((s, f) => s + (RISK_WEIGHTS[f] || 0), 0);
+
     scheduleSummary(uid, {
-      email:        user.email || "",
-      displayName:  user.displayName || "",
-      photoURL:     user.photoURL || "",
-      xp:           xpData.points  || 0,
-      streak:       xpData.streak  || 0,
-      todoCount:    todos.length,
-      trialCount:   trials.length,
-      checkinCount: checkins.length,
+      email:            user.email        || "",
+      displayName:      user.displayName  || "",
+      photoURL:         user.photoURL     || "",
+      xp:               xpData.points     || 0,
+      streak:           xpData.streak     || 0,
+      weeklyActiveDays: xpData.weeklyActiveDays || 0,
+      validBlocks:      xpData.validBlocks      || 0,
+      todoCount:        todos.length,
+      academicTodos,
+      trialTodos,
+      doneTodos,
+      trialCount:       trials.length,
+      lastTrialDate,
+      lastTrialNet,
+      checkinCount:     checkins.length,
+      lastCheckinDate,
       planCount,
+      planDoneCount,
+      adherenceRate,
+      riskFlags,
+      riskScore,
     });
   } catch { /* ignore */ }
+}
+
+// Helper: days from an ISO date string (not timestamp)
+function daysFromDate(isoDate) {
+  if (!isoDate) return 999;
+  return Math.floor((Date.now() - new Date(isoDate).getTime()) / 86400000);
 }
 
 // ============================================================================
@@ -150,11 +247,32 @@ function playSound(type) {
 // ============================================================================
 // XP / Gamification
 // ============================================================================
+
+// XP sadece anlam ifade eden ciktilar icin verilir
+// - blok: minimum 10 dakika, maksimum 90 dakika gecerli
+// - deneme: gercek deneme kaydedilince
+// - todo: sadece academic veya trial tipindeki gorevler
+// - checkin: gunden gune devamlilik
 const XP_R = {
-  block_done: 50, trial_added: 30, todo_done: 15,
-  checkin_4: 100, checkin_3: 60, plan_done: 80,
-  challenge_done: 120, streak_7: 200, streak_14: 500,
+  block_valid:    50,  // gecerli calisma bloku (10-90dk)
+  trial_added:    30,  // deneme kaydedildi
+  todo_academic:  20,  // akademik gorev tamamlandi
+  todo_trial:     20,  // deneme gorev tamamlandi
+  checkin_4:     100,  // 4/4 checkin
+  checkin_3:      60,  // 3/4 checkin
+  plan_done:      80,  // gunluk plan %100 tamamlandi
+  challenge_done: 120, // gunluk challenge tamamlandi
+  streak_7:       200, // 7 gunluk seri
+  streak_14:      500, // 14 gunluk seri
 };
+
+// Session validity kontrolu
+const SESSION_MIN_MINUTES = 10;
+const SESSION_MAX_MINUTES = 90;
+
+function isValidSession(actualMin) {
+  return actualMin >= SESSION_MIN_MINUTES && actualMin <= SESSION_MAX_MINUTES;
+}
 
 const BADGES = [
   { id: "first_block", label: "Ilk Blok", icon: "▶", req: (x) => x.totalBlocks >= 1 },
@@ -190,24 +308,51 @@ function calcLevel(points) {
 const loadXP = () => store.load(KEYS.xp, {
   points: 0, streak: 0, totalBlocks: 0, totalTrials: 0,
   perfect4: 0, plansDone: 0, challengesDone: 0, badges: [], lastDate: "",
+  weeklyActiveDays: 0,   // active days in current week (Mon-Sun)
+  weekStart: "",         // ISO date of current week's Monday
+  validBlocks: 0,        // blocks passing 10-90min validity check
 });
 
-function grantXP(type) {
-  const xp = loadXP();
+function getWeekMonday(dateStr) {
+  const d = new Date(dateStr);
+  const day = d.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diff);
+  return d.toISOString().slice(0, 10);
+}
+
+function grantXP(type, opts = {}) {
+  const xp  = loadXP();
   const pts = XP_R[type] || 0;
   const now = todayStr();
-  if (type === "block_done") {
+
+  if (type === "block_valid") {
     xp.totalBlocks++;
+    xp.validBlocks = (xp.validBlocks || 0) + 1;
+    // Streak (legacy)
     if (xp.lastDate !== now) {
       const y = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-      xp.streak = xp.lastDate === y ? xp.streak + 1 : 1;
+      xp.streak   = xp.lastDate === y ? xp.streak + 1 : 1;
       xp.lastDate = now;
     }
+    // weeklyActiveDays
+    const monday = getWeekMonday(now);
+    if (xp.weekStart !== monday) {
+      xp.weekStart        = monday;
+      xp.weeklyActiveDays = 0;
+      xp.weekActiveDates  = [];
+    }
+    if (!(xp.weekActiveDates || []).includes(now)) {
+      xp.weekActiveDates  = [...(xp.weekActiveDates || []), now];
+      xp.weeklyActiveDays = xp.weekActiveDates.length;
+    }
   }
-  if (type === "trial_added") xp.totalTrials++;
-  if (type === "checkin_4") xp.perfect4++;
-  if (type === "plan_done") xp.plansDone = (xp.plansDone || 0) + 1;
+
+  if (type === "trial_added")    xp.totalTrials++;
+  if (type === "checkin_4")      xp.perfect4++;
+  if (type === "plan_done")      xp.plansDone      = (xp.plansDone      || 0) + 1;
   if (type === "challenge_done") xp.challengesDone = (xp.challengesDone || 0) + 1;
+
   xp.points += pts;
   BADGES.forEach((b) => { if (!xp.badges.includes(b.id) && b.req(xp)) xp.badges.push(b.id); });
   store.save(KEYS.xp, xp);
@@ -298,18 +443,61 @@ function buildTrialTodos(trialData) {
   return todos;
 }
 
-// Day score composite
+// Plan adherence -- dakika bazli (task count degil)
+// adherenceRate = completedMinutes / targetMinutes
+function getPlanAdherence(plans, dateStr) {
+  const dayPlan = plans[dateStr] || [];
+  if (!dayPlan.length) return { rate: 0, completedMin: 0, targetMin: 0, hasData: false };
+  const targetMin    = dayPlan.reduce((s, x) => s + (x.durationMin || 0), 0);
+  const completedMin = dayPlan
+    .filter((x) => x.done)
+    .reduce((s, x) => s + (x.actualMin || x.durationMin || 0), 0);
+  const rate = targetMin > 0 ? Math.round((completedMin / targetMin) * 100) : 0;
+  return { rate, completedMin, targetMin, hasData: true };
+}
+
+// Per-subject adherence
+function getSubjectAdherence(plans, dateStr) {
+  const dayPlan = plans[dateStr] || [];
+  const map = {};
+  dayPlan.forEach((x) => {
+    if (!map[x.subject]) map[x.subject] = { targetMin: 0, completedMin: 0 };
+    map[x.subject].targetMin    += x.durationMin || 0;
+    if (x.done) map[x.subject].completedMin += x.actualMin || x.durationMin || 0;
+  });
+  return Object.entries(map).map(([subject, d]) => ({
+    subject,
+    targetMin:    d.targetMin,
+    completedMin: d.completedMin,
+    rate: d.targetMin > 0 ? Math.round((d.completedMin / d.targetMin) * 100) : 0,
+  }));
+}
+
+// 7-gunluk ortalama adherence
+function getWeeklyAdherence(plans) {
+  const last7 = Array.from({ length: 7 }, (_, i) =>
+    new Date(Date.now() - i * 86400000).toISOString().slice(0, 10)
+  );
+  const days = last7.map((d) => getPlanAdherence(plans, d)).filter((d) => d.hasData);
+  if (!days.length) return 0;
+  return Math.round(days.reduce((s, d) => s + d.rate, 0) / days.length);
+}
+
+// Day score composite -- plan adherence artik dakika bazli
 function getDayScore(plans, checkins, attn) {
-  const today = todayStr();
-  const todayPlan = plans[today] || [];
-  const planPct = todayPlan.length > 0
-    ? Math.round((todayPlan.filter((x) => x.done).length / todayPlan.length) * 100)
-    : 0;
-  const ci = checkins.find((c) => c.date === today);
-  const ciScore = ci ? Math.round((ci.score / 4) * 100) : 0;
+  const today    = todayStr();
+  const adherence = getPlanAdherence(plans, today);
+  const planPct  = adherence.rate;
+  const ci       = checkins.find((c) => c.date === today);
+  const ciScore  = ci ? Math.round((ci.score / 4) * 100) : 0;
   const attnScore = calcAttentionScore(attn[today]?.breaks || []);
-  const combined = Math.round(planPct * 0.5 + ciScore * 0.3 + attnScore * 0.2);
-  return { combined, planPct, ciScore, attnScore, hasData: todayPlan.length > 0 || !!ci };
+  const combined  = Math.round(planPct * 0.5 + ciScore * 0.3 + attnScore * 0.2);
+  return {
+    combined, planPct, ciScore, attnScore,
+    completedMin: adherence.completedMin,
+    targetMin:    adherence.targetMin,
+    hasData: adherence.hasData || !!ci,
+  };
 }
 
 // ============================================================================
@@ -806,8 +994,9 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
   const [winBlockId, setWinBlockId] = useState(null);
 
   // Trial analysis after block done
-  const [pendingTrialItem, setPendingTrialItem] = useState(null);
-  const [delayModal, setDelayModal] = useState(null);
+  const [pendingTrialItem, setPendingTrialItem]   = useState(null);
+  const [delayModal, setDelayModal]               = useState(null);
+  const [sessionCloseItem, setSessionCloseItem]   = useState(null);
 
   // Add form
   const nowMin = nowHHMM();
@@ -837,6 +1026,26 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
     setBreakReason("");
     playSound("start");
     itvRef.current = setInterval(() => setElapsed((p) => p + 1), 1000);
+
+    // Record actual start time and late start delay
+    setPlans((p) => {
+      const todayItems = p[todayStr()] || [];
+      const item = todayItems.find((x) => x.id === id);
+      if (!item) return p;
+      const actualStartMin = nowHHMM();
+      const lateMin = Math.max(0, actualStartMin - item.startMin);
+      if (lateMin > 0) {
+        const updated = todayItems.map((x) =>
+          x.id === id
+            ? { ...x, actualStartMin, lateStartMin: lateMin }
+            : x
+        );
+        const next = { ...p, [todayStr()]: updated };
+        store.save(KEYS.plan, next);
+        return next;
+      }
+      return p;
+    });
   }, []);
 
   const stopTimer = useCallback(() => {
@@ -880,17 +1089,20 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
     const item = (plans[today] || []).find((x) => x.id === id);
     if (!item) return;
 
+    // Session validity check
+    const valid = isValidSession(actualMin);
+
     setPlans((p) => ({
       ...p,
       [today]: (p[today] || []).map((x) =>
-        x.id === id ? { ...x, done: true, doneAt: new Date().toISOString(), actualMin } : x
+        x.id === id ? { ...x, done: true, doneAt: new Date().toISOString(), actualMin, validSession: valid } : x
       ),
     }));
 
     // Backward compat: write to dw sessions
-    const dwPrev = store.load(KEYS.dw, { sessions: [], goalMin: 180 });
+    const dwPrev   = store.load(KEYS.dw, { sessions: [], goalMin: 180 });
     const prevSess = dwPrev.sessions.find((s) => s.date === today);
-    const nb = { id: uid(), dur: actualMin, early, at: new Date().toISOString(), planItemId: id, subject: item.subject };
+    const nb = { id: uid(), dur: actualMin, early, valid, at: new Date().toISOString(), planItemId: id, subject: item.subject };
     const upd = prevSess
       ? { ...prevSess, blocks: [...(prevSess.blocks || []), nb], completedMin: (prevSess.completedMin || 0) + actualMin, earlyBreaks: (prevSess.earlyBreaks || 0) + (early ? 1 : 0) }
       : { date: today, goalMin: 180, blocks: [nb], completedMin: actualMin, earlyBreaks: early ? 1 : 0 };
@@ -904,47 +1116,70 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
       });
     }
 
-    // XP + level check
-    const prevXP = loadXP();
-    const prevLv = calcLevel(prevXP.points);
-    const { pts } = grantXP("block_done");
-    const newXP = loadXP();
-    const newLv = calcLevel(newXP.points);
-    const didLevelUp = newLv.name !== prevLv.name;
+    // XP -- sadece gecerli session'lar icin (10-90dk)
+    if (valid) {
+      const prevXP = loadXP();
+      const prevLv = calcLevel(prevXP.points);
+      const { pts } = grantXP("block_valid");
+      const newXP  = loadXP();
+      const newLv  = calcLevel(newXP.points);
 
-    setWinBlockId(id);
-    setTimeout(() => setWinBlockId(null), 600);
+      setWinBlockId(id);
+      setTimeout(() => setWinBlockId(null), 600);
 
-    if (didLevelUp) {
-      playSound("level_up");
-      setXpBurst({ pts: pts + 100, label: `LEVEL UP: ${newLv.name}!` });
-      setTimeout(() => toast(`LEVEL UP! ${newLv.name}`, newLv.color), 400);
+      if (newLv.name !== prevLv.name) {
+        playSound("level_up");
+        setXpBurst({ pts: pts + 100, label: `LEVEL UP: ${newLv.name}!` });
+        setTimeout(() => toast(`LEVEL UP! ${newLv.name}`, newLv.color), 400);
+      } else {
+        playSound("block_win");
+        setXpBurst({ pts, label: early ? "Erken bitti -- devam!" : "Blok tamam!" });
+      }
+
+      // Streak milestone
+      if (newXP.streak === 7 || newXP.streak === 14) {
+        playSound("streak");
+        const bonusPts = newXP.streak >= 14 ? XP_R.streak_14 : XP_R.streak_7;
+        const bonusXP  = loadXP();
+        bonusXP.points += bonusPts;
+        store.save(KEYS.xp, bonusXP);
+        setTimeout(() => toast(`🔥 ${newXP.streak} gun serisi! +${bonusPts} XP`, "var(--ora)"), 800);
+      }
+
+      // All plan done?
+      // Plan tamam kontrolu -- sadece tam tamamlanan (erken mola olmayan) bloklar sayilir
+      const remaining = (plans[today] || []).filter((x) => !x.done && x.id !== id).length;
+      const earlyBreaks = (plans[today] || []).filter((x) => x.done && x.actualMin != null && x.actualMin < x.durationMin && x.id !== id).length;
+      const currentIsEarly = early;
+      if (remaining === 0 && !currentIsEarly && earlyBreaks === 0 && (plans[today] || []).length > 0) {
+        grantXP("plan_done");
+        setTimeout(() => toast(`+${XP_R.plan_done} XP -- Gunluk plan TAMAM!`, "var(--grn)"), 1200);
+      }
     } else {
-      playSound("block_win");
-      setXpBurst({ pts, label: early ? "Erken bitti -- devam!" : "Blok tamam!" });
+      // Gecersiz session -- bilgilendir ama XP verme
+      if (actualMin < SESSION_MIN_MINUTES) {
+        toast(`${actualMin}dk -- Gecerli blok icin en az ${SESSION_MIN_MINUTES}dk gerekli`, "var(--muted)");
+      } else {
+        toast(`${actualMin}dk -- Blok tamamlandi (max ${SESSION_MAX_MINUTES}dk limit)`, "var(--acc)");
+      }
+      setWinBlockId(id);
+      setTimeout(() => setWinBlockId(null), 600);
     }
 
-    // Streak milestone
-    if (newXP.streak === 7 || newXP.streak === 14 || newXP.streak === 30) {
-      playSound("streak");
-      const bonusPts = newXP.streak >= 14 ? XP_R.streak_14 : XP_R.streak_7;
-      const bonusKey = newXP.streak >= 14 ? "streak_14" : "streak_7";
-      const bonusXP = loadXP();
-      bonusXP.points += bonusPts;
-      store.save(KEYS.xp, bonusXP);
-      setTimeout(() => toast(`🔥 ${newXP.streak} gun serisi! +${bonusPts} XP`, "var(--ora)"), 800);
-    }
-
-    // All done?
-    const remaining = (plans[today] || []).filter((x) => !x.done && x.id !== id).length;
-    if (remaining === 0 && (plans[today] || []).length > 0) {
-      grantXP("plan_done");
-      setTimeout(() => toast(`+${XP_R.plan_done} XP -- Gunluk plan TAMAM!`, "var(--grn)"), 1200);
-    }
-
+    // Deneme ise analiz formunu ac
     if (item.kind === "trial") {
       setPendingTrialItem(item);
+      stopTimer();
+      return;
     }
+
+    // Gecerli study session ise konu sorusu sor
+    if (valid && item.kind === "study") {
+      setSessionCloseItem({ id, subject: item.subject, actualMin });
+      stopTimer();
+      return;
+    }
+
     stopTimer();
   };
 
@@ -1022,6 +1257,25 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
 
       {/* Overlays */}
       {xpBurst && <XPBurst pts={xpBurst.pts} label={xpBurst.label} onDone={() => setXpBurst(null)} />}
+      {sessionCloseItem && (
+        <SessionCloseModal
+          subject={sessionCloseItem.subject}
+          actualMin={sessionCloseItem.actualMin}
+          onSave={(topicData) => {
+            // Save structured session data alongside the plan item
+            setPlans((p) => ({
+              ...p,
+              [today]: (p[today] || []).map((x) =>
+                x.id === sessionCloseItem.id
+                  ? { ...x, sessionTopic: topicData }
+                  : x
+              ),
+            }));
+            setSessionCloseItem(null);
+          }}
+          onSkip={() => setSessionCloseItem(null)}
+        />
+      )}
       {focusChallenge && (
         <FocusChallengePopup
           elapsed={elapsed}
@@ -1059,18 +1313,27 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
             <div>
               <Label style={{ marginBottom: "2px" }}>Odak Modu</Label>
               <p style={{ fontSize: "13px", fontWeight: "600", color: "var(--acc)" }}>{activeItem.subject}</p>
+              <p style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--muted)", marginTop: "2px" }}>
+                {fmtMMSS(elapsed)} gecti
+              </p>
             </div>
-            <p style={{ fontFamily: "var(--mono)", fontSize: "30px", fontWeight: "900", color: "var(--acc)", textShadow: "0 0 12px #e8c54750" }}>
-              {fmtMMSS(Math.max(0, activeItem.durationMin * 60 - elapsed))}
-            </p>
+            <div style={{ textAlign: "right" }}>
+              <p style={{ fontFamily: "var(--mono)", fontSize: "28px", fontWeight: "900", color: "var(--acc)", textShadow: "0 0 12px #e8c54750", lineHeight: 1 }}>
+                {fmtMMSS(Math.max(0, activeItem.durationMin * 60 - elapsed))}
+              </p>
+              <p style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)", marginTop: "3px" }}>kaliyor</p>
+            </div>
           </div>
           <PBar value={elapsed} max={activeItem.durationMin * 60} color="var(--acc)" h={5} />
           <p style={{ fontSize: "11px", color: "var(--muted)", fontStyle: "italic", lineHeight: "1.6", margin: "10px 0" }}>"{quote}"</p>
           <div style={{ display: "flex", gap: "8px" }}>
             <Btn variant="ghost" onClick={requestEarlyBreak} style={{ flex: 1 }}>Mola iste</Btn>
             <Btn variant="success"
+              disabled={elapsed < 30}
               onClick={() => { clearInterval(itvRef.current); finishBlock(activeId, Math.floor(elapsed / 60), false, null); }}
-              style={{ flex: 1 }}>Bitir</Btn>
+              style={{ flex: 1 }}>
+              Bitir ({fmtMMSS(elapsed)})
+            </Btn>
           </div>
         </Card>
       )}
@@ -1078,7 +1341,12 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
       {/* Break reason picker */}
       {timerPhase === "warn" && activeItem && (
         <Card style={{ border: "1px solid var(--red)44", background: "var(--red)06" }} className="flashR fi">
-          <Label style={{ marginBottom: "6px" }}>Erken mola -- neden?</Label>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+            <Label>Erken mola -- neden?</Label>
+            <span style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--ora)" }}>
+              {fmtMMSS(elapsed)} / {fmtMMSS(activeItem.durationMin * 60)} calistin
+            </span>
+          </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: "5px", marginBottom: "10px" }}>
             {BREAK_REASONS.map((r) => (
               <button key={r} onClick={() => setBreakReason(r)}
@@ -1263,11 +1531,26 @@ function PlanTab({ trials, setTrials, todos, onPushTodos }) {
 function PlanItemRow({ item, nowMin, activeId, elapsed, timerPhase, winBlockId, onStart, onStop, onDone, onDelete }) {
   const isActive = activeId === item.id;
   const isWin    = winBlockId === item.id;
-  const status = item.done ? "done" : isActive ? "active" : nowMin > item.startMin + item.durationMin ? "late" : "upcoming";
-  const colMap = { done: "var(--grn)", active: "var(--acc)", late: "var(--red)", upcoming: "var(--muted)" };
-  const col = colMap[status];
-  const pct = isActive ? clamp(Math.round((elapsed / (item.durationMin * 60)) * 100), 0, 100) : item.done ? 100 : 0;
-  const borderCss = status === "late" ? "var(--red)33" : status === "active" ? "var(--acc)33" : status === "done" ? "var(--grn)22" : item.kind === "trial" ? "var(--blu)33" : "var(--b2)";
+
+  // earlyBreak: done but actualMin < durationMin
+  const isEarlyBreak = item.done && item.actualMin != null && item.actualMin < item.durationMin;
+  const isFullDone   = item.done && !isEarlyBreak;
+
+  const status = item.done
+    ? (isEarlyBreak ? "early" : "done")
+    : isActive ? "active"
+    : nowMin > item.startMin + item.durationMin ? "late"
+    : "upcoming";
+
+  const colMap   = { done: "var(--grn)", early: "var(--ora)", active: "var(--acc)", late: "var(--red)", upcoming: "var(--muted)" };
+  const col      = colMap[status];
+  const pct      = isActive ? clamp(Math.round((elapsed / (item.durationMin * 60)) * 100), 0, 100) : isFullDone ? 100 : isEarlyBreak ? Math.round((item.actualMin / item.durationMin) * 100) : 0;
+  const borderCss = status === "late"   ? "var(--red)33"
+                  : status === "active" ? "var(--acc)33"
+                  : status === "done"   ? "var(--grn)22"
+                  : status === "early"  ? "var(--ora)33"
+                  : item.kind === "trial" ? "var(--blu)33"
+                  : "var(--b2)";
 
   return (
     <div className={`sr${isWin ? " blockWin" : ""}`}
@@ -1280,20 +1563,34 @@ function PlanItemRow({ item, nowMin, activeId, elapsed, timerPhase, winBlockId, 
               {item.kind === "trial" && <Tag color="var(--blu)">{item.trialType || "TYT"}</Tag>}
               <p style={{ fontSize: "13px", fontWeight: "500", textDecoration: item.done ? "line-through" : "none", color: item.done ? "var(--muted)" : "var(--txt)" }}>{item.subject}</p>
             </div>
-            <div style={{ display: "flex", gap: "6px", marginTop: "3px", alignItems: "center" }}>
-              <span style={{ fontSize: "10px", color: "var(--muted)" }}>{fmtHHMM(item.durationMin)}</span>
+            <div style={{ display: "flex", gap: "6px", marginTop: "3px", alignItems: "center", flexWrap: "wrap" }}>
+              <span style={{ fontSize: "10px", color: "var(--muted)" }}>{fmtHHMM(item.durationMin)} hedef</span>
               {item.note && <span style={{ fontSize: "10px", color: "var(--muted)" }}>· {item.note}</span>}
-              {status === "late" && <Tag color="var(--red)">Gecikmis</Tag>}
+              {status === "late" && !item.done && <Tag color="var(--red)">Gecikmis</Tag>}
               {item.delayReason && <span style={{ fontSize: "10px", color: "var(--ora)" }}>· {item.delayReason}</span>}
-              {item.done && item.actualMin && item.actualMin !== item.durationMin && (
-                <span style={{ fontSize: "9px", color: "var(--acc)" }}>{fmtHHMM(item.actualMin)} gercek</span>
+              {item.lateStartMin > 0 && (
+                <span style={{ fontSize: "9px", color: "var(--red)", fontFamily: "var(--mono)" }}>
+                  {item.lateStartMin}dk gec basladi
+                </span>
+              )}
+              {item.done && item.actualMin != null && (
+                item.actualMin < item.durationMin
+                  ? <span style={{ fontSize: "9px", color: "var(--ora)" }}>
+                      {fmtHHMM(item.actualMin)} calistin · {fmtHHMM(item.durationMin - item.actualMin)} eksik
+                    </span>
+                  : <span style={{ fontSize: "9px", color: "var(--grn)" }}>
+                      {fmtHHMM(item.actualMin)} tamamlandi
+                    </span>
+              )}
+              {item.done && item.validSession === false && item.actualMin != null && item.actualMin < SESSION_MIN_MINUTES && (
+                <Tag color="var(--muted)">gecersiz ({item.actualMin}dk)</Tag>
               )}
             </div>
           </div>
         </div>
         <div style={{ display: "flex", gap: "4px", flexShrink: 0 }}>
           {!item.done && !isActive && <Btn size="sm" variant="accent" onClick={onStart}>▶</Btn>}
-          {isActive && timerPhase === "run" && <Btn size="sm" variant="success" onClick={onDone}>✓</Btn>}
+          {isActive && timerPhase === "run" && elapsed > 30 && <Btn size="sm" variant="success" onClick={onDone}>✓</Btn>}
           {isActive && <Btn size="sm" variant="ghost" onClick={onStop} style={{ color: "var(--muted)" }}>◼</Btn>}
           {!item.done && !isActive && <Btn size="sm" variant="ghost" onClick={onDone} style={{ color: "var(--grn)" }}>✓</Btn>}
           <Btn size="sm" variant="ghost" onClick={onDelete} style={{ color: "var(--red)" }}>×</Btn>
@@ -1306,6 +1603,11 @@ function PlanItemRow({ item, nowMin, activeId, elapsed, timerPhase, winBlockId, 
             <span style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--muted)" }}>{pct}%</span>
           </div>
           <PBar value={elapsed} max={item.durationMin * 60} color="var(--acc)" h={3} />
+        </div>
+      )}
+      {isEarlyBreak && (
+        <div style={{ marginTop: "6px" }}>
+          <PBar value={item.actualMin} max={item.durationMin} color="var(--ora)" h={3} />
         </div>
       )}
     </div>
@@ -1330,6 +1632,85 @@ function DelayModal({ delayedMin, onConfirm, onCancel }) {
         <div style={{ display: "flex", gap: "8px" }}>
           <Btn variant="ghost" onClick={onCancel} style={{ flex: 1 }}>Iptal</Btn>
           <Btn variant="primary" onClick={() => onConfirm(reason || "Belirtilmedi")} style={{ flex: 2 }} disabled={!reason}>Kaydet</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// SESSION CLOSE MODAL -- ask what was studied for structured session data
+// ============================================================================
+function SessionCloseModal({ subject, actualMin, onSave, onSkip }) {
+  const [topic, setTopic]       = useState("");
+  const [feeling, setFeeling]   = useState(""); // "iyi" | "orta" | "zor"
+  const [notes, setNotes]       = useState("");
+
+  const handleSave = () => {
+    onSave({
+      subject,
+      topic:    topic.trim() || subject,
+      feeling,
+      notes:    notes.trim(),
+      actualMin,
+      savedAt:  new Date().toISOString(),
+    });
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.8)", display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 1000, padding: "0", backdropFilter: "blur(4px)" }}>
+      <div className="pi" style={{ background: "var(--s1)", border: "1px solid var(--b1)", borderRadius: "14px 14px 0 0", padding: "22px", maxWidth: "540px", width: "100%" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
+          <div>
+            <p style={{ fontFamily: "var(--mono)", fontSize: "11px", color: "var(--grn)", fontWeight: "600", letterSpacing: "1px" }}>BLOK TAMAMLANDI</p>
+            <p style={{ fontSize: "14px", fontWeight: "600", marginTop: "2px" }}>{subject} -- {actualMin}dk</p>
+          </div>
+          <button onClick={onSkip} style={{ background: "none", color: "var(--muted)", fontSize: "18px", cursor: "pointer" }}>×</button>
+        </div>
+
+        {/* Topic */}
+        <div style={{ marginBottom: "12px" }}>
+          <Label style={{ marginBottom: "5px" }}>Hangi konuyu calismadin?</Label>
+          <input
+            value={topic}
+            onChange={(e) => setTopic(e.target.value)}
+            placeholder={`${subject} -- konu (orn: Turev, Limit...)`}
+            autoFocus
+            style={{ width: "100%", padding: "9px 11px", fontSize: "13px", borderRadius: "7px" }}
+          />
+        </div>
+
+        {/* Feeling */}
+        <div style={{ marginBottom: "12px" }}>
+          <Label style={{ marginBottom: "5px" }}>Nasil gitti?</Label>
+          <div style={{ display: "flex", gap: "6px" }}>
+            {[
+              { key: "iyi",  label: "Iyi gitti",    color: "var(--grn)" },
+              { key: "orta", label: "Idare eder",   color: "var(--acc)" },
+              { key: "zor",  label: "Zorlandim",    color: "var(--red)" },
+            ].map((f) => (
+              <button key={f.key} onClick={() => setFeeling(f.key)}
+                style={{ flex: 1, padding: "8px", borderRadius: "7px", fontSize: "12px", cursor: "pointer", border: `1px solid ${feeling === f.key ? f.color : "var(--b2)"}`, background: feeling === f.key ? `${f.color}20` : "transparent", color: feeling === f.key ? f.color : "var(--muted)" }}>
+                {f.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Notes (optional) */}
+        <div style={{ marginBottom: "16px" }}>
+          <Label style={{ marginBottom: "5px" }}>Not (opsiyonel)</Label>
+          <input
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+            placeholder="Anlamadim, tekrar lazim, vs..."
+            style={{ width: "100%", padding: "8px 11px", fontSize: "12px", borderRadius: "7px" }}
+          />
+        </div>
+
+        <div style={{ display: "flex", gap: "8px" }}>
+          <Btn variant="ghost" onClick={onSkip} style={{ flex: 1 }}>Atla</Btn>
+          <Btn variant="primary" onClick={handleSave} style={{ flex: 2 }} disabled={!feeling}>Kaydet</Btn>
         </div>
       </div>
     </div>
@@ -1752,6 +2133,15 @@ function QuickTodoAdd({ todos, onPushTodos }) {
 // ============================================================================
 // TODOS TAB
 // ============================================================================
+
+// Todo tipleri -- rehberlikci academic ve trial'a odaklanir
+const TODO_TYPES = {
+  academic: { l: "Akademik", c: "var(--blu)",  icon: "▶" },
+  trial:    { l: "Deneme",   c: "var(--pur)",  icon: "◉" },
+  personal: { l: "Kisisel",  c: "var(--muted)", icon: "◻" },
+};
+
+// Legacy priority -> type mapping (eski veriler icin)
 const PRIOS = {
   high:   { l: "Acil",  c: "var(--red)"   },
   medium: { l: "Orta",  c: "var(--acc)"   },
@@ -1759,16 +2149,19 @@ const PRIOS = {
 };
 
 function TodosTab({ todos, setTodos }) {
-  const [text, setText] = useState("");
-  const [prio, setPrio] = useState("high");
-  const [filt, setFilt] = useState("active");
+  const [text, setText]       = useState("");
+  const [prio, setPrio]       = useState("high");
+  const [todoType, setTodoType] = useState("academic");
+  const [filt, setFilt]       = useState("active");
 
   const overdue = todos.filter((t) => !t.done && !t.reviewed && t.reviewAt && daysFrom(t.reviewAt) >= 0);
 
   const add = () => {
     if (!text.trim()) return;
     const u = [{
-      id: uid(), text: text.trim(), source: "Manuel", priority: prio,
+      id: uid(), text: text.trim(), source: "Manuel",
+      priority: prio,
+      todoType,               // "academic" | "trial" | "personal"
       done: false, reviewed: false,
       createdAt: new Date().toISOString(),
       reviewAt: new Date(Date.now() + 7 * 86400000).toISOString(),
@@ -1783,7 +2176,13 @@ function TodosTab({ todos, setTodos }) {
     const u = todos.map((t) => (t.id === id ? { ...t, done: !t.done, reviewed: true } : t));
     setTodos(u);
     store.save(KEYS.todos, u);
-    if (before && !before.done) { grantXP("todo_done"); toast(`+${XP_R.todo_done} XP`, "var(--grn)"); }
+    if (before && !before.done) {
+      // XP sadece akademik ve deneme gorevleri icin
+      const type = before.todoType || "personal";
+      if (type === "academic") { grantXP("todo_academic"); toast(`+${XP_R.todo_academic} XP`, "var(--grn)"); }
+      else if (type === "trial") { grantXP("todo_trial"); toast(`+${XP_R.todo_trial} XP`, "var(--grn)"); }
+      // personal gorevler XP vermiyor
+    }
   };
 
   const del = (id) => {
@@ -1823,6 +2222,16 @@ function TodosTab({ todos, setTodos }) {
           <input value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => e.key === "Enter" && add()} placeholder="Yeni gorev..." style={{ flex: 1, padding: "7px 10px", fontSize: "12px" }} />
           <Btn variant="primary" onClick={add}>Ekle</Btn>
         </div>
+        {/* Todo tipi sec */}
+        <div style={{ display: "flex", gap: "4px", marginBottom: "6px" }}>
+          {Object.entries(TODO_TYPES).map(([k, { l, c }]) => (
+            <button key={k} onClick={() => setTodoType(k)}
+              style={{ padding: "3px 8px", borderRadius: "4px", border: "1px solid", fontSize: "10px", cursor: "pointer", borderColor: todoType === k ? c : "var(--b2)", background: todoType === k ? `${c}22` : "transparent", color: todoType === k ? c : "var(--muted)" }}>
+              {l}
+            </button>
+          ))}
+        </div>
+        {/* Oncelik sec */}
         <div style={{ display: "flex", gap: "4px" }}>
           {Object.entries(PRIOS).map(([k, { l, c }]) => (
             <button key={k} onClick={() => setPrio(k)}
@@ -1858,6 +2267,11 @@ function TodosTab({ todos, setTodos }) {
               <div style={{ flex: 1, minWidth: 0 }}>
                 <p style={{ fontSize: "12px", lineHeight: "1.4", textDecoration: t.done ? "line-through" : "none", color: t.done ? "var(--muted)" : "var(--txt)" }}>{t.text}</p>
                 <div style={{ display: "flex", gap: "5px", marginTop: "3px", flexWrap: "wrap" }}>
+                  {t.todoType && TODO_TYPES[t.todoType] && (
+                    <span style={{ fontFamily: "var(--mono)", fontSize: "9px", padding: "1px 5px", borderRadius: "3px", background: `${TODO_TYPES[t.todoType].c}18`, color: TODO_TYPES[t.todoType].c, border: `1px solid ${TODO_TYPES[t.todoType].c}33` }}>
+                      {TODO_TYPES[t.todoType].l}
+                    </span>
+                  )}
                   <Tag color={PRIOS[t.priority]?.c}>{PRIOS[t.priority]?.l}</Tag>
                   {t.source && <span style={{ fontSize: "9px", color: "var(--muted)" }}>← {t.source}</span>}
                   {t.reviewAt && daysFrom(t.reviewAt) >= 0 && !t.done && !t.reviewed && (
@@ -2221,10 +2635,14 @@ export default function App() {
   const [xp, setXp]         = useState(loadXP);
   const toasts              = useToastSystem();
 
-  const [user, setUser]       = useState(undefined);
-  const [syncing, setSyncing] = useState(false);
-  const [isAdmin, setIsAdmin] = useState(false);
+  const [user, setUser]           = useState(undefined);
+  const [syncing, setSyncing]     = useState(false);
+  const [isAdmin, setIsAdmin]     = useState(false);
   const [showAdmin, setShowAdmin] = useState(false);
+  const [profile, setProfile]     = useState(null);
+  const [profileLoading, setProfileLoading]   = useState(true);
+  const [forceStudent, setForceStudent]       = useState(false);
+  const [showAssignPanel, setShowAssignPanel] = useState(false); // Phase 2 admin assignment
 
   // Admin check -- uid degisince calis
   useEffect(() => {
@@ -2253,6 +2671,13 @@ export default function App() {
         _syncUser = fbUser;
 
         writeProfile(fbUser.uid, fbUser);
+
+        // Fetch full profile (includes role, institutionId, groupId)
+        // Await before setting profileLoading=false so routing waits
+        getUserProfile(fbUser.uid).then((p) => {
+          setProfile(p);
+          setProfileLoading(false);
+        });
 
         // Hemen summary yaz -- admin panelinde gorunsun
         scheduleSummary(fbUser.uid, {
@@ -2293,6 +2718,8 @@ export default function App() {
         _syncUser = null;
         setIsAdmin(false);
         setShowAdmin(false);
+        setProfile(null);
+        setProfileLoading(false);
       }
     });
     return unsub;
@@ -2329,12 +2756,51 @@ export default function App() {
     return { plan: planLate, brain: 0, trials: 0, todos: todoOverdue, discipline: missingCheckin };
   }, [todos, checkins, plans, tab]);
 
-  if (user === undefined) {
+  if (user === undefined || (user && profileLoading)) {
     return (
       <div style={{ minHeight: "100vh", background: "var(--bg)", display: "flex", alignItems: "center", justifyContent: "center" }}>
         <style>{CSS}</style>
         <span style={{ fontFamily: "var(--mono)", fontSize: "11px", color: "var(--muted)", animation: "blink 1.5s ease infinite" }}>...</span>
       </div>
+    );
+  }
+
+  // super_admin assignment panel -- Phase 2
+  if ((isAdmin || profile?.role === "super_admin") && showAssignPanel) {
+    return (
+      <AdminAssignPanel onClose={() => setShowAssignPanel(false)} />
+    );
+  }
+
+  // Counselor / institution_admin / super_admin --> dedicated dashboard
+  const isCounselorRole = profile?.role === "counselor" ||
+                          profile?.role === "institution_admin" ||
+                          profile?.role === "super_admin";
+
+  if (user && isCounselorRole && !showAdmin && !forceStudent) {
+    return (
+      <CounselorDashboard
+        profile={profile}
+        user={user}
+        onSignOut={() => {
+          signOutUser();
+          _syncUid   = null;
+          _syncUser  = null;
+          setProfile(null);
+          setProfileLoading(true);
+          setForceStudent(false);
+        }}
+        onSwitchToStudent={
+          profile?.role === "super_admin"
+            ? () => setForceStudent(true)
+            : null
+        }
+        onOpenAssign={
+          (profile?.role === "super_admin" || isAdmin)
+            ? () => setShowAssignPanel(true)
+            : null
+        }
+      />
     );
   }
 
@@ -2362,6 +2828,18 @@ export default function App() {
       <style>{CSS}</style>
       <div style={{ width: "100%", maxWidth: "540px" }}>
         <Header onToggleHeat={() => setHeat((p) => !p)} heatOpen={heatOpen} alerts={alerts} xp={xp} />
+        {forceStudent && (
+          <div style={{ display: "flex", gap: "6px", marginBottom: "10px" }}>
+            <button onClick={() => setForceStudent(false)} style={{ flex: 1, padding: "7px", fontFamily: "var(--mono)", fontSize: "9px", color: "var(--pur)", background: "var(--pur)10", border: "1px solid var(--pur)33", borderRadius: "7px", cursor: "pointer" }}>
+              Danisma Paneline Don
+            </button>
+            {(isAdmin || profile?.role === "super_admin") && (
+              <button onClick={() => setShowAssignPanel(true)} style={{ flex: 1, padding: "7px", fontFamily: "var(--mono)", fontSize: "9px", color: "var(--acc)", background: "var(--acc)10", border: "1px solid var(--acc)33", borderRadius: "7px", cursor: "pointer" }}>
+                Kullanici Atama
+              </button>
+            )}
+          </div>
+        )}
         <AuthBanner
           user={user}
           syncing={syncing}

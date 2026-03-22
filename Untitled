@@ -1,0 +1,489 @@
+import { useEffect, useMemo, useState } from "react";
+import { getGroupStudents } from "./firebase.js";
+
+// ============================================================================
+// Utils
+// ============================================================================
+const fmtTs = (ts) => {
+  if (!ts) return "--";
+  const d = ts.seconds ? new Date(ts.seconds * 1000) : new Date(ts);
+  const diff = Math.floor((Date.now() - d.getTime()) / 60000);
+  if (diff < 60)    return `${diff}dk once`;
+  if (diff < 1440)  return `${Math.floor(diff / 60)}s once`;
+  return `${Math.floor(diff / 1440)}g once`;
+};
+
+// Derive temporary risk view from available summary fields
+// Used until Phase 3 writes real riskFlags/riskScore
+function deriveRisk(student) {
+  const flags = [];
+  let score   = 0;
+  const now   = Date.now();
+
+  // Last seen > 2 days
+  const lastSeenMs = student.lastSeen?.seconds
+    ? student.lastSeen.seconds * 1000
+    : student.lastSeen ? new Date(student.lastSeen).getTime() : 0;
+  if (lastSeenMs && now - lastSeenMs > 2 * 86400000) {
+    flags.push("no_login_2d");
+    score += 10;
+  }
+
+  // Streak = 0
+  if (!student.streak || student.streak === 0) {
+    flags.push("streak_broken");
+    score += 15;
+  }
+
+  // Plan rate low (< 40%)
+  const planRate = student.planRate ?? (
+    student.planCount > 0
+      ? Math.round((student.planDoneCount || 0) / student.planCount * 100)
+      : null
+  );
+  if (planRate !== null && planRate < 40) {
+    flags.push("plan_rate_low");
+    score += 25;
+  }
+
+  // No trials
+  if (!student.trialCount || student.trialCount === 0) {
+    flags.push("no_trial");
+    score += 20;
+  }
+
+  // Use real riskFlags/riskScore if they exist
+  const finalFlags = student.riskFlags?.length ? student.riskFlags : flags;
+  const finalScore = student.riskScore   != null ? student.riskScore  : score;
+
+  return {
+    flags: finalFlags,
+    score: finalScore,
+    level: finalScore >= 50 ? "high" : finalScore >= 25 ? "mid" : "low",
+    planRate: planRate ?? 0,
+  };
+}
+
+// Sort: highest risk first, then lowest planRate
+function sortStudents(students) {
+  return [...students].sort((a, b) => {
+    const ra = deriveRisk(a);
+    const rb = deriveRisk(b);
+    if (rb.score !== ra.score) return rb.score - ra.score;
+    return ra.planRate - rb.planRate;
+  });
+}
+
+// ============================================================================
+// CSS
+// ============================================================================
+const CSS = `
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:#060606; --s1:#0e0e0e; --s2:#151515;
+    --b1:#1e1e1e; --b2:#282828;
+    --txt:#e6e6e6; --muted:#4a4a4a;
+    --acc:#e8c547; --red:#e05252; --grn:#4caf7d;
+    --blu:#5b9cf6; --pur:#a78bfa; --ora:#f59e0b;
+    --mono:'IBM Plex Mono',monospace;
+    --sans:'IBM Plex Sans',sans-serif;
+  }
+  html, body {
+    background: var(--bg);
+    color: var(--txt);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  button { cursor: pointer; font-family: var(--sans); border: none; }
+  button:hover:not(:disabled) { filter: brightness(1.12); }
+  @keyframes fadeUp { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:none; } }
+  @keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+  @keyframes blink  { 0%,100%{opacity:1} 50%{opacity:.3} }
+  .fu { animation: fadeUp .2s ease both; }
+  .fi { animation: fadeIn .15s ease both; }
+`;
+
+// ============================================================================
+// Primitives (self-contained, no AppShell dependency)
+// ============================================================================
+const Card = ({ children, style, className }) => (
+  <div className={className} style={{
+    background: "var(--s1)", border: "1px solid var(--b1)",
+    borderRadius: "10px", padding: "14px", ...style,
+  }}>
+    {children}
+  </div>
+);
+
+const Label = ({ children, style }) => (
+  <p style={{
+    fontFamily: "var(--mono)", fontSize: "10px", fontWeight: "600",
+    color: "var(--muted)", letterSpacing: "1.4px", textTransform: "uppercase", ...style,
+  }}>
+    {children}
+  </p>
+);
+
+const Btn = ({ children, onClick, variant = "default", style, disabled }) => {
+  const V = {
+    default: { background: "var(--s2)", color: "var(--txt)", border: "1px solid var(--b2)" },
+    primary: { background: "var(--acc)", color: "#000", fontWeight: "600" },
+    ghost:   { background: "transparent", color: "var(--muted)" },
+    accent:  { background: "var(--acc)18", color: "var(--acc)", border: "1px solid var(--acc)33" },
+  };
+  return (
+    <button onClick={onClick} disabled={disabled} style={{
+      ...V[variant], padding: "7px 14px", fontSize: "12px",
+      borderRadius: "7px", opacity: disabled ? 0.4 : 1, ...style,
+    }}>
+      {children}
+    </button>
+  );
+};
+
+const PBar = ({ value, max, color = "var(--acc)", h = 4 }) => {
+  const pct = max > 0 ? Math.min((value / max) * 100, 100) : 0;
+  return (
+    <div style={{ height: h, background: "var(--b1)", borderRadius: "999px", overflow: "hidden" }}>
+      <div style={{ height: "100%", width: `${pct}%`, background: color, borderRadius: "999px", transition: "width .6s ease" }} />
+    </div>
+  );
+};
+
+// ============================================================================
+// Risk badge
+// ============================================================================
+const RISK_COLOR = { high: "var(--red)", mid: "var(--ora)", low: "var(--grn)" };
+const RISK_LABEL = { high: "Riskli",     mid: "Dikkat",     low: "Iyi"       };
+const FLAG_LABEL = {
+  no_login_2d:    "2g giris yok",
+  streak_broken:  "Streak 0",
+  plan_rate_low:  "Plan dusuk",
+  no_trial:       "Deneme yok",
+  no_checkin_3d:  "3g checkin yok",
+  no_trial_7d:    "7g deneme yok",
+};
+
+function RiskBadge({ level }) {
+  const c = RISK_COLOR[level];
+  return (
+    <span style={{
+      fontFamily: "var(--mono)", fontSize: "9px", fontWeight: "700",
+      padding: "2px 8px", borderRadius: "4px",
+      background: `${c}18`, color: c, border: `1px solid ${c}44`,
+      whiteSpace: "nowrap",
+    }}>
+      {RISK_LABEL[level]}
+    </span>
+  );
+}
+
+// ============================================================================
+// Student card
+// ============================================================================
+function StudentCard({ student, onClick }) {
+  const risk     = deriveRisk(student);
+  const riskColor = RISK_COLOR[risk.level];
+
+  return (
+    <div
+      onClick={onClick}
+      className="fu"
+      style={{
+        padding: "13px 14px",
+        background: "var(--s1)",
+        border: `1px solid ${risk.level === "high" ? "var(--red)33" : risk.level === "mid" ? "var(--ora)22" : "var(--b1)"}`,
+        borderRadius: "10px",
+        cursor: "pointer",
+        transition: "border-color .2s",
+      }}
+      onMouseEnter={(e) => e.currentTarget.style.borderColor = "var(--acc)44"}
+      onMouseLeave={(e) => e.currentTarget.style.borderColor =
+        risk.level === "high" ? "var(--red)33" : risk.level === "mid" ? "var(--ora)22" : "var(--b1)"}
+    >
+      {/* Top row */}
+      <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "10px" }}>
+        {student.photoURL
+          ? <img src={student.photoURL} alt="" style={{ width: "32px", height: "32px", borderRadius: "50%", flexShrink: 0 }} />
+          : <div style={{ width: "32px", height: "32px", borderRadius: "50%", background: "var(--b2)", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "12px", color: "var(--muted)" }}>{(student.displayName || "?")[0]}</div>
+        }
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <p style={{ fontSize: "13px", fontWeight: "500", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {student.displayName || student.email || "Isimsiz"}
+          </p>
+          <p style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)", marginTop: "1px" }}>
+            {fmtTs(student.lastSeen)}
+          </p>
+        </div>
+        <RiskBadge level={risk.level} />
+      </div>
+
+      {/* Stats row */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "6px", marginBottom: "10px" }}>
+        {[
+          { l: "XP",     v: student.xp        || 0,   c: "var(--pur)" },
+          { l: "Streak", v: `🔥${student.streak || 0}`, c: "var(--acc)" },
+          { l: "Deneme", v: student.trialCount || 0,   c: "var(--blu)" },
+          { l: "Plan%",  v: `${risk.planRate}%`,        c: risk.planRate >= 70 ? "var(--grn)" : risk.planRate >= 40 ? "var(--acc)" : "var(--red)" },
+        ].map((x) => (
+          <div key={x.l} style={{ textAlign: "center", padding: "6px 4px", background: "var(--s2)", borderRadius: "6px" }}>
+            <p style={{ fontFamily: "var(--mono)", fontSize: "13px", fontWeight: "700", color: x.c, lineHeight: 1 }}>{x.v}</p>
+            <p style={{ fontSize: "8px", color: "var(--muted)", marginTop: "2px" }}>{x.l}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* Plan rate bar */}
+      <PBar value={risk.planRate} max={100} color={risk.planRate >= 70 ? "var(--grn)" : risk.planRate >= 40 ? "var(--acc)" : "var(--red)"} h={3} />
+
+      {/* Risk flags */}
+      {risk.flags.length > 0 && (
+        <div style={{ display: "flex", gap: "4px", flexWrap: "wrap", marginTop: "8px" }}>
+          {risk.flags.map((f) => (
+            <span key={f} style={{
+              fontFamily: "var(--mono)", fontSize: "8px", padding: "2px 6px",
+              background: `${riskColor}12`, color: riskColor,
+              borderRadius: "4px", border: `1px solid ${riskColor}33`,
+            }}>
+              {FLAG_LABEL[f] || f}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================================
+// Student detail drawer
+// ============================================================================
+function StudentDetail({ student, onClose }) {
+  if (!student) return null;
+  const risk = deriveRisk(student);
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, background: "rgba(0,0,0,.8)",
+      display: "flex", alignItems: "flex-end", justifyContent: "center",
+      zIndex: 999, padding: "0",
+    }} onClick={onClose}>
+      <div
+        className="fu"
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: "var(--s1)", border: "1px solid var(--b1)",
+          borderRadius: "14px 14px 0 0", padding: "20px",
+          width: "100%", maxWidth: "560px",
+          maxHeight: "80vh", overflowY: "auto",
+        }}
+      >
+        {/* Header */}
+        <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "16px" }}>
+          {student.photoURL
+            ? <img src={student.photoURL} alt="" style={{ width: "40px", height: "40px", borderRadius: "50%" }} />
+            : <div style={{ width: "40px", height: "40px", borderRadius: "50%", background: "var(--b2)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "16px" }}>{(student.displayName || "?")[0]}</div>
+          }
+          <div style={{ flex: 1 }}>
+            <p style={{ fontWeight: "600", fontSize: "14px" }}>{student.displayName || "Isimsiz"}</p>
+            <p style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)" }}>{student.email}</p>
+          </div>
+          <RiskBadge level={risk.level} />
+          <button onClick={onClose} style={{ background: "none", color: "var(--muted)", fontSize: "20px", padding: "0 4px" }}>×</button>
+        </div>
+
+        {/* Stats grid */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "8px", marginBottom: "14px" }}>
+          {[
+            { l: "XP",          v: student.xp           || 0,    c: "var(--pur)" },
+            { l: "Streak",      v: `🔥 ${student.streak  || 0}`, c: "var(--acc)" },
+            { l: "Plan Uyumu",  v: `%${risk.planRate}`,           c: risk.planRate >= 70 ? "var(--grn)" : risk.planRate >= 40 ? "var(--acc)" : "var(--red)" },
+            { l: "Deneme",      v: student.trialCount   || 0,    c: "var(--blu)" },
+            { l: "Gorev",       v: student.todoCount    || 0,    c: "var(--acc)" },
+            { l: "Check-in",    v: student.checkinCount || 0,    c: "var(--grn)" },
+          ].map((x) => (
+            <div key={x.l} style={{ padding: "10px", background: "var(--s2)", borderRadius: "8px", textAlign: "center" }}>
+              <p style={{ fontFamily: "var(--mono)", fontSize: "18px", fontWeight: "700", color: x.c }}>{x.v}</p>
+              <p style={{ fontSize: "9px", color: "var(--muted)", marginTop: "2px" }}>{x.l}</p>
+            </div>
+          ))}
+        </div>
+
+        {/* Plan bar */}
+        <div style={{ marginBottom: "14px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "5px" }}>
+            <Label>Plan Uyumu</Label>
+            <span style={{ fontFamily: "var(--mono)", fontSize: "10px", color: risk.planRate >= 70 ? "var(--grn)" : risk.planRate >= 40 ? "var(--acc)" : "var(--red)" }}>%{risk.planRate}</span>
+          </div>
+          <PBar value={risk.planRate} max={100} color={risk.planRate >= 70 ? "var(--grn)" : risk.planRate >= 40 ? "var(--acc)" : "var(--red)"} h={6} />
+        </div>
+
+        {/* Risk flags */}
+        {risk.flags.length > 0 && (
+          <div style={{ marginBottom: "14px" }}>
+            <Label style={{ marginBottom: "6px" }}>Risk Isaretleri</Label>
+            <div style={{ display: "flex", gap: "5px", flexWrap: "wrap" }}>
+              {risk.flags.map((f) => (
+                <span key={f} style={{
+                  fontFamily: "var(--mono)", fontSize: "10px", padding: "4px 9px",
+                  background: `${RISK_COLOR[risk.level]}15`, color: RISK_COLOR[risk.level],
+                  borderRadius: "5px", border: `1px solid ${RISK_COLOR[risk.level]}33`,
+                }}>
+                  {FLAG_LABEL[f] || f}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Last seen */}
+        <div style={{ padding: "8px 11px", background: "var(--s2)", borderRadius: "7px" }}>
+          <p style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--muted)" }}>
+            Son giris: <span style={{ color: "var(--txt)" }}>{fmtTs(student.lastSeen)}</span>
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Main CounselorDashboard
+// ============================================================================
+export default function CounselorDashboard({ profile, user, onSignOut }) {
+  const [students,  setStudents]  = useState([]);
+  const [loading,   setLoading]   = useState(true);
+  const [selected,  setSelected]  = useState(null);
+  const [filter,    setFilter]    = useState("all"); // all | high | mid | low
+
+  const institutionId = profile?.institutionId;
+  const groupId       = profile?.groupId;
+  const role          = profile?.role;
+
+  useEffect(() => {
+    if (!institutionId) { setLoading(false); return; }
+    getGroupStudents(institutionId, role === "institution_admin" ? null : groupId)
+      .then((data) => { setStudents(data); setLoading(false); });
+  }, [institutionId, groupId, role]);
+
+  const sorted = useMemo(() => {
+    const withRisk = students.map((s) => ({ ...s, _risk: deriveRisk(s) }));
+    const filtered = filter === "all" ? withRisk : withRisk.filter((s) => s._risk.level === filter);
+    return filtered.sort((a, b) => {
+      if (b._risk.score !== a._risk.score) return b._risk.score - a._risk.score;
+      return a._risk.planRate - b._risk.planRate;
+    });
+  }, [students, filter]);
+
+  const counts = useMemo(() => ({
+    high: students.filter((s) => deriveRisk(s).level === "high").length,
+    mid:  students.filter((s) => deriveRisk(s).level === "mid").length,
+    low:  students.filter((s) => deriveRisk(s).level === "low").length,
+  }), [students]);
+
+  return (
+    <div style={{ minHeight: "100vh", background: "var(--bg)", fontFamily: "var(--sans)", display: "flex", justifyContent: "center", padding: "24px 12px 80px" }}>
+      <style>{CSS}</style>
+      <div style={{ width: "100%", maxWidth: "600px" }}>
+
+        {/* Header */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "20px" }}>
+          <div>
+            <p style={{ fontFamily: "var(--mono)", fontSize: "10px", color: "var(--muted)", letterSpacing: "2px", marginBottom: "4px" }}>
+              {role === "institution_admin" ? "KURUM YONETICISI" : "REHBERLIKCI"}
+            </p>
+            <h1 style={{ fontFamily: "var(--mono)", fontSize: "18px", fontWeight: "700", color: "var(--acc)" }}>
+              Ogrenci Paneli
+            </h1>
+            {user?.displayName && (
+              <p style={{ fontSize: "11px", color: "var(--muted)", marginTop: "3px" }}>{user.displayName}</p>
+            )}
+          </div>
+          <button onClick={onSignOut} style={{
+            fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)",
+            background: "none", border: "1px solid var(--b2)", borderRadius: "5px",
+            padding: "5px 10px", cursor: "pointer",
+          }}>
+            Cikis
+          </button>
+        </div>
+
+        {/* No institution assigned */}
+        {!institutionId && !loading && (
+          <div style={{ textAlign: "center", padding: "60px 20px" }}>
+            <p style={{ fontFamily: "var(--mono)", fontSize: "24px", color: "var(--b2)", marginBottom: "12px" }}>◈</p>
+            <p style={{ fontSize: "13px", fontWeight: "500", color: "var(--muted)", marginBottom: "6px" }}>Kuruma atanmamissiniz</p>
+            <p style={{ fontSize: "11px", color: "var(--b2)", lineHeight: "1.6", maxWidth: "220px", margin: "0 auto" }}>
+              Kurum yoneticisinden kuruma eklemenizi isteyin.
+            </p>
+          </div>
+        )}
+
+        {/* Loading */}
+        {loading && (
+          <p style={{ fontFamily: "var(--mono)", fontSize: "11px", color: "var(--muted)", textAlign: "center", padding: "40px", animation: "blink 1.5s ease infinite" }}>
+            Yukleniyor...
+          </p>
+        )}
+
+        {/* Dashboard */}
+        {!loading && institutionId && (
+          <>
+            {/* Summary bar */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "7px", marginBottom: "16px" }}>
+              {[
+                { key: "high", label: "Riskli",  color: "var(--red)" },
+                { key: "mid",  label: "Dikkat",  color: "var(--ora)" },
+                { key: "low",  label: "Iyi",     color: "var(--grn)" },
+              ].map((x) => (
+                <button key={x.key} onClick={() => setFilter(filter === x.key ? "all" : x.key)} style={{
+                  padding: "10px 8px", borderRadius: "8px", textAlign: "center",
+                  background: filter === x.key ? `${x.color}20` : "var(--s1)",
+                  border: `1px solid ${filter === x.key ? x.color : "var(--b1)"}`,
+                  cursor: "pointer", transition: "all .15s",
+                }}>
+                  <p style={{ fontFamily: "var(--mono)", fontSize: "20px", fontWeight: "700", color: x.color, lineHeight: 1 }}>{counts[x.key]}</p>
+                  <p style={{ fontSize: "9px", color: "var(--muted)", marginTop: "3px" }}>{x.label}</p>
+                </button>
+              ))}
+            </div>
+
+            {/* Total */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+              <Label>
+                {filter === "all" ? `Tum ogrenciler (${students.length})` : `${RISK_LABEL[filter]} (${counts[filter]})`}
+              </Label>
+              {filter !== "all" && (
+                <button onClick={() => setFilter("all")} style={{ fontFamily: "var(--mono)", fontSize: "9px", color: "var(--muted)", background: "none", border: "none", cursor: "pointer" }}>
+                  Tumunu goster
+                </button>
+              )}
+            </div>
+
+            {/* Empty state */}
+            {sorted.length === 0 && (
+              <div style={{ textAlign: "center", padding: "50px 20px" }}>
+                <p style={{ fontFamily: "var(--mono)", fontSize: "22px", color: "var(--b2)", marginBottom: "10px" }}>◻</p>
+                <p style={{ fontSize: "12px", color: "var(--muted)" }}>
+                  {students.length === 0
+                    ? "Henuz ogrenci yok. Ogrencilerin kuruma katilmasi gerekiyor."
+                    : "Bu filtrede ogrenci yok."}
+                </p>
+              </div>
+            )}
+
+            {/* Student cards */}
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+              {sorted.map((s) => (
+                <StudentCard key={s.uid} student={s} onClick={() => setSelected(s)} />
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Student detail drawer */}
+      {selected && <StudentDetail student={selected} onClose={() => setSelected(null)} />}
+    </div>
+  );
+}
